@@ -1511,7 +1511,7 @@ VOID VmmReadScatterPhysical(_In_ VMM_HANDLE H, _Inout_ PPMEM_SCATTER ppMEMsPhys,
             pMEM = ppMEMsPhys[i];
             tp = MEM_SCATTER_STACK_POP(pMEM);
             if(fCachePut) {
-                if((tp == 1) && pMEM->f) { // 1 = normal read
+                if((tp == 1) && pMEM->f && (pMEM->cb == 0x1000)) {      // 1 = normal page-sized read
                     if((pObReservedMEM = VmmCacheReserve(H, VMM_CACHE_TAG_PHYS))) {
                         pObReservedMEM->h.f = TRUE;
                         pObReservedMEM->h.qwA = pMEM->qwA;

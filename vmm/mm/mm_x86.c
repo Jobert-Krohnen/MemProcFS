@@ -178,12 +178,14 @@ VOID MmX86_Virt2PhysEx(_In_ VMM_HANDLE H, _In_ PVMM_V2P_ENTRY pV2Ps, _In_ DWORD 
         if(fUserOnly && !(pte & 0x04)) { continue; }            // SUPERVISOR PAGE & USER MODE REQ
         if(iPML == 1) {     // 4kB PAGE:
             pV2P->pa = pte & 0xfffff000;
+            pV2P->pa = pV2P->pa | (0xfff & pV2P->va);           // FILL LOWER ADDRESS BITS
             pV2P->fPhys = TRUE;
             continue;
         }
         if(pte & 0x80) {    // 4MB PAGE:
             if(pte & 0x003e0000) { continue; }                  // RESERVED
             pV2P->pa = (((QWORD)(pte & 0x0001e000)) << (32 - 13)) + (pte & 0xffc00000) + (pV2P->va & 0x003ff000);
+            pV2P->pa = pV2P->pa | (0x3fffff & pV2P->va);        // FILL LOWER ADDRESS BITS
             pV2P->fPhys = TRUE;
             continue;
         }
