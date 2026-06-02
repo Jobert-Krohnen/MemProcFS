@@ -39,7 +39,7 @@ To capture live memory (without PCILeech FPGA hardware) download [DumpIt](https:
 PCILeech FPGA will require hardware as well as _FTD3XXWU.dll_ to be dropped alongside the MemProcFS binaries. Please check out the [LeechCore](https://github.com/ufrisk/LeechCore) project for instructions.
 
 ## Linux
-MemProcFS is dependent on packages, do a `sudo apt-get install libusb-1.0 fuse` before trying out MemProcFS. If building from source check out the guide about [MemProcFS on Linux](https://github.com/ufrisk/MemProcFS/wiki/_Linux).
+MemProcFS should be possible to run out-of-the-box on most Linux distros with FUSE installed. If building from source check out the guide about [MemProcFS on Linux](https://github.com/ufrisk/MemProcFS/wiki/_Linux).
 
 ## macOS
 Download the latest MemProcFS release from [here](https://github.com/ufrisk/MemProcFS/releases/latest). MemProcFS when used as a mounted virtual file system depends on **macFuse** which requires a .kext. Download and install macFuse [here](https://github.com/macfuse/macfuse/releases/latest). If MemProcFS is used via the supported C/C++/Rust APIs macFuse is not required.
