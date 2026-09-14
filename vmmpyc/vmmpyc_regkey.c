@@ -7,7 +7,6 @@
 
 PyObject *g_pPyType_RegKey = NULL;
 
-_Success_(return != NULL)
 PyObject* VmmPycReg_NameOriginal(_In_ PyObj_Vmm *pyVMM, _In_ LPSTR uszPath, _In_ BOOL fValue)
 {
     BOOL fResult;
@@ -65,22 +64,25 @@ static PyObject*
 VmmPycRegKey_values(PyObj_RegKey *self, void *closure)
 {
     BOOL fResult;
-    DWORD cch, i = 0;
+    DWORD cch, cchMax, i = 0;
     PyObject *pyList;
     CHAR usz[2 * MAX_PATH];
     LPSTR uszValueName;
     if(!self->fValid) { return PyErr_Format(PyExc_RuntimeError, "RegKey.subkeys(): Not initialized."); }
+    cch = (DWORD)strnlen(self->uszPath, sizeof(self->uszPath));
+    if(cch >= sizeof(usz) - 1) { return PyList_New(0); }
     if(!(pyList = PyList_New(0))) { return PyErr_NoMemory(); }
     strcpy_s(usz, _countof(usz), self->uszPath);
-    cch = (DWORD)strlen(usz);
+    cchMax = min(MAX_PATH, (DWORD)sizeof(usz) - cch - 1);
     usz[cch] = '\\';
     uszValueName = usz + cch + 1;
     while(TRUE) {
         Py_BEGIN_ALLOW_THREADS;
-        cch = MAX_PATH;
+        cch = cchMax;
         fResult = VMMDLL_WinReg_EnumValueU(self->pyVMM->hVMM, self->uszPath, i++, uszValueName, &cch, NULL, NULL, NULL);
         Py_END_ALLOW_THREADS;
         if(!fResult) { break; }
+        if(!cch || (cch > cchMax)) { break; }
         PyList_Append_DECREF(pyList, (PyObject*)VmmPycRegValue_InitializeInternal(self->pyVMM, usz, FALSE));
     }
     return pyList;
@@ -91,23 +93,26 @@ static PyObject*
 VmmPycRegKey_values_dict(PyObj_RegKey *self, void *closure)
 {
     BOOL fResult;
-    DWORD cch, i = 0;
+    DWORD cch, cchMax, i = 0;
     PyObject *pyDict;
     PyObj_RegValue *pyObjValue;
     CHAR usz[2 * MAX_PATH];
     LPSTR uszValueName;
     if(!self->fValid) { return PyErr_Format(PyExc_RuntimeError, "RegKey.values_dict(): Not initialized."); }
+    cch = (DWORD)strnlen(self->uszPath, sizeof(self->uszPath));
+    if(cch >= sizeof(usz) - 1) { return PyDict_New(); }
     if(!(pyDict = PyDict_New())) { return PyErr_NoMemory(); }
     strcpy_s(usz, _countof(usz), self->uszPath);
-    cch = (DWORD)strlen(usz);
+    cchMax = min(MAX_PATH, (DWORD)sizeof(usz) - cch - 1);
     usz[cch] = '\\';
     uszValueName = usz + cch + 1;
     while(TRUE) {
         Py_BEGIN_ALLOW_THREADS;
-        cch = MAX_PATH;
+        cch = cchMax;
         fResult = VMMDLL_WinReg_EnumValueU(self->pyVMM->hVMM, self->uszPath, i++, uszValueName, &cch, NULL, NULL, NULL);
         Py_END_ALLOW_THREADS;
         if(!fResult) { break; }
+        if(!cch || (cch > cchMax)) { break; }
         if((pyObjValue = VmmPycRegValue_InitializeInternal(self->pyVMM, usz, FALSE))) {
             PyDict_SetItemUnicode_DECREF(pyDict, pyObjValue->pyName, (PyObject*)pyObjValue);
         }
@@ -120,22 +125,25 @@ static PyObject*
 VmmPycRegKey_subkeys(PyObj_RegKey *self, void *closure)
 {
     BOOL fResult;
-    DWORD cch, i = 0;
+    DWORD cch, cchMax, i = 0;
     PyObject *pyList;
     CHAR usz[2*MAX_PATH];
     LPSTR uszKeyName;
     if(!self->fValid) { return PyErr_Format(PyExc_RuntimeError, "RegKey.subkeys(): Not initialized."); }
+    cch = (DWORD)strnlen(self->uszPath, sizeof(self->uszPath));
+    if(cch >= sizeof(usz) - 1) { return PyList_New(0); }
     if(!(pyList = PyList_New(0))) { return PyErr_NoMemory(); }
     strcpy_s(usz, _countof(usz), self->uszPath);
-    cch = (DWORD)strlen(usz);
+    cchMax = min(MAX_PATH, (DWORD)sizeof(usz) - cch - 1);
     usz[cch] = '\\';
     uszKeyName = usz + cch + 1;
     while(TRUE) {
         Py_BEGIN_ALLOW_THREADS;
-        cch = MAX_PATH;
+        cch = cchMax;
         fResult = VMMDLL_WinReg_EnumKeyExU(self->pyVMM->hVMM, self->uszPath, i++, uszKeyName, &cch, NULL);
         Py_END_ALLOW_THREADS;
         if(!fResult) { break; }
+        if(!cch || (cch > cchMax)) { break; }
         PyList_Append_DECREF(pyList, (PyObject*)VmmPycRegKey_InitializeInternal(self->pyVMM, usz, FALSE));
     }
     return pyList;
@@ -146,23 +154,26 @@ static PyObject*
 VmmPycRegKey_subkeys_dict(PyObj_RegKey *self, void *closure)
 {   
     BOOL fResult;
-    DWORD cch, i = 0;
+    DWORD cch, cchMax, i = 0;
     PyObject *pyDict;
     PyObj_RegKey *pyObjKey;
     CHAR usz[2*MAX_PATH];
     LPSTR uszKeyName;
     if(!self->fValid) { return PyErr_Format(PyExc_RuntimeError, "RegKey.subkeys_dict(): Not initialized."); }
+    cch = (DWORD)strnlen(self->uszPath, sizeof(self->uszPath));
+    if(cch >= sizeof(usz) - 1) { return PyDict_New(); }
     if(!(pyDict = PyDict_New())) { return PyErr_NoMemory(); }
     strcpy_s(usz, _countof(usz), self->uszPath);
-    cch = (DWORD)strlen(usz);
+    cchMax = min(MAX_PATH, (DWORD)sizeof(usz) - cch - 1);
     usz[cch] = '\\';
     uszKeyName = usz + cch + 1;
     while(TRUE) {
         Py_BEGIN_ALLOW_THREADS;
-        cch = MAX_PATH;
+        cch = cchMax;
         fResult = VMMDLL_WinReg_EnumKeyExU(self->pyVMM->hVMM, self->uszPath, i++, uszKeyName, &cch, NULL);
         Py_END_ALLOW_THREADS;
         if(!fResult) { break; }
+        if(!cch || (cch > cchMax)) { break; }
         if((pyObjKey = VmmPycRegKey_InitializeInternal(self->pyVMM, usz, FALSE))) {
             PyDict_SetItemUnicode_DECREF(pyDict, pyObjKey->pyName, (PyObject*)pyObjKey);
         }

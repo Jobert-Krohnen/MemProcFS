@@ -108,7 +108,7 @@ static int vfs_read(const char *uszPath, char *buffer, size_t size, off_t offset
     }
     // 2: read
     nt = VMMDLL_VfsReadU(g_hVMM, (LPSTR)uszPathCopy, (PBYTE)buffer, size, &readlength, offset);
-    return ((nt == VMMDLL_STATUS_SUCCESS) || (nt == VMMDLL_STATUS_END_OF_FILE)) ? (int)readlength : 0;
+    return ((nt == VMMDLL_STATUS_SUCCESS) || (nt == VMMDLL_STATUS_END_OF_FILE)) ? (int)readlength : -EIO;
 }
 
 static int vfs_truncate(const char *path, off_t size)
@@ -129,7 +129,8 @@ static int vfs_write(const char *uszPath, const char *buffer, size_t size, off_t
     }
     // 2: write
     nt = VMMDLL_VfsWriteU(g_hVMM, (LPSTR)uszPathCopy, (PBYTE)buffer, size, &writelength, offset);
-    return ((nt == VMMDLL_STATUS_SUCCESS) || (nt == VMMDLL_STATUS_END_OF_FILE)) ? (int)size : 0;
+    if((nt != VMMDLL_STATUS_SUCCESS) && (nt != VMMDLL_STATUS_END_OF_FILE)) { return -EIO; }
+    return (writelength == size) ? (int)writelength : -EIO;
 }
 
 static struct fuse_operations vfs_operations = {

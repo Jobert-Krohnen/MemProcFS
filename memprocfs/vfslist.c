@@ -127,7 +127,7 @@ PVFSLISTOB_DIRECTORY VfsList_GetDirectory(_In_ LPSTR uszPath)
     QWORD i = 0, qwHash;
     PVFSLISTOB_DIRECTORY pObDir = NULL;
     VMMDLL_VFS_FILELIST2 VfsFileList;
-    CHAR c, uszPathCopy[3 * MAX_PATH];
+    CHAR c, uszPathCopy[3 * MAX_PATH] = { 0 };
     // 1: try fetch from cache:
     qwHash = CharUtil_HashPathFsU(uszPath);
     if((pObDir = ObCacheMap_GetByKey(g_ctxVfsList.pcm, qwHash))) {

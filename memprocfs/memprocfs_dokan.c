@@ -238,7 +238,7 @@ VOID VfsDokan_Close(_In_ CHAR chMountPoint)
         if(wchMountPoint) {
             hModuleDokan = LoadLibraryExA("dokan2.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
             if(!hModuleDokan) {
-                hModuleDokan = LoadLibraryA("dokan2.dll");
+                hModuleDokan = LoadLibraryExA("dokan2.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
             }
             if(hModuleDokan) {
                 pfnDokanUnmount = (BOOL(WINAPI *)(WCHAR))GetProcAddress(hModuleDokan, "DokanUnmount");
@@ -343,7 +343,7 @@ VOID VfsDokan_InitializeAndMount(_In_ CHAR chMountPoint)
     // allocate
     hModuleDokan = LoadLibraryExA("dokan2.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if(!hModuleDokan) {
-        hModuleDokan = LoadLibraryA("dokan2.dll");
+        hModuleDokan = LoadLibraryExA("dokan2.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
     if(!hModuleDokan) {
         printf("MOUNT: Failed. The required DOKANY file system library is not installed. \n");
@@ -538,7 +538,7 @@ int wmain(_In_ int argc, _In_ wchar_t* argv[])
             return 1;
         }
     }
-    LoadLibraryA("leechcore.dll");
+    LoadLibraryExA("leechcore.dll", NULL, LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
     if(!(szArgs = LocalAlloc(LMEM_ZEROINIT, (argc + 1ULL) * sizeof(LPSTR)))) {
         printf("MemProcFS: Out of memory!\n");
         return 1;

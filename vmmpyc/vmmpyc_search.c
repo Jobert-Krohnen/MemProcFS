@@ -49,16 +49,14 @@ VmmPycSearch_start(PyObj_Search *self, PyObject *args)
     HANDLE hThread;
     if(!self->fValid) { return PyErr_Format(PyExc_RuntimeError, "VmmSearch.start(): Not initialized."); }
     if(!self->ctxSearch.cSearch) { return PyErr_Format(PyExc_RuntimeError, "VmmSearch.start(): No search criteria."); }
-    if(self->fStarted) { Py_BuildValue("s", NULL); }      // None returned on success.
+    if(self->fStarted) { return Py_BuildValue("s", NULL); }      // None returned on success.
+    self->fStarted = TRUE;
     Py_BEGIN_ALLOW_THREADS;
-    if(!self->fStarted) {
-        self->fStarted = TRUE;
-        hThread = CreateThread(NULL, 0, VmmPycSearch_start_ThreadProc, self, 0, NULL);
-        if(hThread) {
-            CloseHandle(hThread);
-        } else {
-            self->fCompleted = TRUE;
-        }
+    hThread = CreateThread(NULL, 0, VmmPycSearch_start_ThreadProc, self, 0, NULL);
+    if(hThread) {
+        CloseHandle(hThread);
+    } else {
+        self->fCompleted = TRUE;
     }
     Py_END_ALLOW_THREADS;
     return Py_BuildValue("s", NULL);        // None returned on success.

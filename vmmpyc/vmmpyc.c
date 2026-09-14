@@ -78,6 +78,7 @@ PyObject* VmmPyc_MemRead_Multi(_In_ VMM_HANDLE H, _In_ DWORD dwPID, _In_ LPSTR s
         return PyErr_Format(PyExc_RuntimeError, "%s: Illegal argument.", szFN);
     }
     cItem = (DWORD)PyList_Size(pyListSrc);
+    if(cItem > 0x01000000) { return PyErr_NoMemory(); }
     pMultiInfo = LocalAlloc(LMEM_ZEROINIT, cItem * sizeof(struct MultiInfo));
     hS = VMMDLL_Scatter_Initialize(H, dwPID, (DWORD)flags);
     pyListResult = PyList_New(0);
@@ -303,6 +304,7 @@ PyObject* VmmPyc_MemReadType(_In_ VMM_HANDLE H, _In_ DWORD dwPID, _In_ LPSTR szF
         flags = PyLong_AsUnsignedLongLong(pyObjArg1);
     }
     cItem = (DWORD)PyList_Size(pyObjArg0);
+    if(cItem > (SIZE_T)-1 / sizeof(struct MultiInfo)) { return PyErr_NoMemory(); }
     pMultiInfo = LocalAlloc(LMEM_ZEROINIT, cItem * sizeof(struct MultiInfo));
     if(!pMultiInfo) { goto fail; }
     hS = VMMDLL_Scatter_Initialize(H, dwPID, (DWORD)flags | VMMDLL_FLAG_NO_PREDICTIVE_READ);

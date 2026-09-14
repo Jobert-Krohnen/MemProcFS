@@ -73,7 +73,7 @@ static HMODULE VmmlxLoader_LoadLocalModule()
     if(0 != wcscpy_s(wszSlash + 1, _countof(wszPath) - (wszSlash + 1 - wszPath), L"vmmlx.dll")) {
         return NULL;
     }
-    g_VmmlxLoader.hModule = LoadLibraryW(wszPath);
+    g_VmmlxLoader.hModule = LoadLibraryExW(wszPath, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     return g_VmmlxLoader.hModule;
 }
 #elif defined(MACOS)

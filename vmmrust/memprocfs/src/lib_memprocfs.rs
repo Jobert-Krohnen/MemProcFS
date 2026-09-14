@@ -89,6 +89,16 @@ use std::ffi::{CStr, CString, c_char, c_int};
 use std::fmt;
 use anyhow::{anyhow, Context};
 use serde::{Serialize, Deserialize};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Plain-data traits for values passed to the typed memory APIs.
+pub use bytemuck::{Pod, Zeroable};
+
+mod leechcore_callbacks;
+
+#[cfg(test)]
+mod tests;
 
 
 
@@ -1070,7 +1080,8 @@ impl Vmm<'_> {
     ///     println!("e_lfanew: {:x}", doshdr.e_lfanew);
     /// }
     /// ```
-    pub fn mem_read_as<T>(&self, pa : u64, flags : u64) -> ResultEx<T> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn mem_read_as<T : Pod>(&self, pa : u64, flags : u64) -> ResultEx<T> {
         return self.impl_mem_read_as(u32::MAX, pa, flags);
     }
 
@@ -1123,7 +1134,8 @@ impl Vmm<'_> {
     /// let data_to_write = [0x56, 0x4d, 0x4d, 0x52, 0x55, 0x53, 0x54];
     /// let _r = vmm.mem_write_as(0x1000, &data_to_write);
     /// ```
-    pub fn mem_write_as<T>(&self, pa : u64, data : &T) -> ResultEx<()> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn mem_write_as<T : Pod>(&self, pa : u64, data : &T) -> ResultEx<()> {
         return self.impl_mem_write_as(u32::MAX, pa, data);
     }
 
@@ -1624,7 +1636,8 @@ impl <'a> VmmScatterMemory<'a> {
     ///   * `data_to_read.0` - Address to start read from.
     ///   * `data_to_read.1` - Generic Type/Struct to fill with read data on success.
     ///   * `data_to_read.2` - Bytes actually read on `mem_scatter.execute()` call. Should be zero at call to `mem_scatter.prepare_ex()`.
-    pub fn prepare_ex_as<T>(&mut self, data_to_read : &'a mut (u64, T, u32)) -> ResultEx<()> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn prepare_ex_as<T : Pod>(&mut self, data_to_read : &'a mut (u64, T, u32)) -> ResultEx<()> {
         return self.impl_prepare_ex_as(data_to_read);
     }
 }
@@ -1675,7 +1688,8 @@ impl VmmScatterMemory<'_> {
     /// # Arguments
     /// * `va` - Address to prepare to write to.
     /// * `data` - Data to write. In case of a struct repr(C) is recommended.
-    pub fn prepare_write_as<T>(&self, va : u64, data : &T) -> ResultEx<()> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn prepare_write_as<T : Pod>(&self, va : u64, data : &T) -> ResultEx<()> {
         return self.impl_prepare_write_as(va, data);
     }
 
@@ -1695,7 +1709,8 @@ impl VmmScatterMemory<'_> {
     }
 
     /// Read memory prepared after the `execute()` call.
-    pub fn read_as<T>(&self, va : u64) -> ResultEx<T> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn read_as<T : Pod>(&self, va : u64) -> ResultEx<T> {
         return self.impl_read_as(va);
     }
 
@@ -2787,7 +2802,8 @@ impl VmmProcess<'_> {
     ///     println!("e_lfanew: {:x}", doshdr.e_lfanew);
     /// }
     /// ```
-    pub fn mem_read_as<T>(&self, va : u64, flags : u64) -> ResultEx<T> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn mem_read_as<T : Pod>(&self, va : u64, flags : u64) -> ResultEx<T> {
         return self.vmm.impl_mem_read_as(self.pid, va, flags);
     }
 
@@ -2858,7 +2874,8 @@ impl VmmProcess<'_> {
     /// let data_to_write = [0x56, 0x4d, 0x4d, 0x52, 0x55, 0x53, 0x54];
     /// let _r = vmmprocess.mem_write_as(va_kernel32, &data_to_write);
     /// ```
-    pub fn mem_write_as<T>(&self, va : u64, data : &T) -> ResultEx<()> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn mem_write_as<T : Pod>(&self, va : u64, data : &T) -> ResultEx<()> {
         return self.vmm.impl_mem_write_as(self.pid, va, data);
     }
 
@@ -3359,7 +3376,7 @@ pub struct VmmSearch<'a> {
     native_search : CVMMDLL_MEM_SEARCH_CONTEXT,
     search_terms : Vec<CVMMDLL_MEM_SEARCH_CONTEXT_SEARCHENTRY>,
     thread : Option<std::thread::JoinHandle<bool>>,
-    result : Vec<(u64, u32)>,
+    shared : Arc<VmmSearchShared<(u64, u32)>>,
 }
 
 /// Info: Search Progress/Result.
@@ -3472,6 +3489,8 @@ impl VmmSearch<'_> {
     }
 
     /// Abort an on-going search.
+    /// Cancellation is checked at native callbacks and completion. A range
+    /// without callbacks may finish before cancellation takes effect.
     /// 
     /// # Examples
     /// ```
@@ -3482,6 +3501,7 @@ impl VmmSearch<'_> {
     }
 
     /// Poll an on-going search for the status/result.
+    /// Progress reflects the most recent native callback or completion.
     /// 
     /// Also see [`VmmSearch`] and [`VmmSearchResult`].
     /// 
@@ -3570,7 +3590,7 @@ pub struct VmmYara<'a> {
     _native_args_rules : Vec<CString>,
     _native_argv_rules : Vec<*const c_char>,
     thread : Option<std::thread::JoinHandle<bool>>,
-    result : Vec<VmmYaraMatch>,
+    shared : Arc<VmmSearchShared<VmmYaraMatch>>,
 }
 
 /// Info: Yara search Progress/Result.
@@ -3662,6 +3682,8 @@ impl VmmYara<'_> {
     }
 
     /// Abort an on-going yara search.
+    /// Cancellation is checked at native callbacks and completion. A range
+    /// without callbacks may finish before cancellation takes effect.
     /// 
     /// # Examples
     /// ```
@@ -3672,6 +3694,7 @@ impl VmmYara<'_> {
     }
 
     /// Poll an on-going yara search for the status/result.
+    /// Progress reflects the most recent native callback or completion.
     /// 
     /// Also see [`VmmYara`] and [`VmmYaraResult`].
     /// 
@@ -3709,7 +3732,12 @@ impl VmmYara<'_> {
 /// This should usually be the first call in a `InitializeVmmPlugin()` export.
 ///
 /// See the plugin example for additional documentation.
-pub fn new_plugin_initialization<T>(native_h : usize, native_reginfo : usize) -> ResultEx<(VmmPluginInitializationInfo, VmmPluginInitializationContext<T>)> {
+///
+/// # Safety
+/// Call only from the native plugin initializer with its live handle and
+/// registration pointer. Register or drop the returned context before the
+/// initializer returns. The native host must retain the plugin until close.
+pub unsafe fn new_plugin_initialization<T>(native_h : usize, native_reginfo : usize) -> ResultEx<(VmmPluginInitializationInfo, VmmPluginInitializationContext<T>)> {
     return impl_new_plugin_initialization::<T>(native_h, native_reginfo);
 }
 
@@ -3955,7 +3983,7 @@ pub struct VmmPluginInitializationContext<T> {
     pub fn_notify  : Option<fn(ctxp : &VmmPluginContext<T>, event_id : u32) -> ResultEx<()>>,
 }
 
-impl<T> VmmPluginInitializationContext<T> {
+impl<T : Send + Sync + 'static> VmmPluginInitializationContext<T> {
     /// Register the plugin with the MemProcFS plugin sub-system.
     /// 
     /// The initialiation context may not be used after the `register()` call.
@@ -4107,18 +4135,19 @@ pub struct LcBarRequest {
 ///
 pub struct LcBarContext<'a, T> {
     /// Access the general LeechCore API through the `lc` field.
-    pub lc     : &'a LeechCore,
+    pub lc     : LeechCore,
     /// Access generic user-set plugin context in a thread-safe way.
     pub ctxlock : std::sync::RwLock<T>,
     fn_callback : fn(ctx : &LcBarContext<T>, req : &LcBarRequest) -> ResultEx<()>,
     native_ctx : usize,
+    _lifetime : std::marker::PhantomData<&'a ()>,
 }
 
 /// PCIe BAR wrapper context - returned to the caller of the BAR enable function.
 pub struct LcBarContextWrap<'a, T> {
     /// Access to the underlying context.
-    pub ctx     : &'a LcBarContext::<'a, T>,
-    native      : *mut LcBarContext::<'a, T>,
+    pub ctx     : Arc<LcBarContext<'static, T>>,
+    _lifetime   : std::marker::PhantomData<&'a LeechCore>,
 }
 
 /// PCIe TLP Context: Supplied by LeechCore to the TLP callback function.
@@ -4144,18 +4173,19 @@ pub struct LcBarContextWrap<'a, T> {
 ///
 pub struct LcTlpContext<'a, T> {
     /// Access the general LeechCore API through the `lc` field.
-    pub lc     : &'a LeechCore,
+    pub lc     : LeechCore,
     /// Access generic user-set plugin context in a thread-safe way.
     pub ctxlock : std::sync::RwLock<T>,
     fn_callback : fn(ctx : &LcTlpContext<T>, tlp : &[u8], tlp_str : &str) -> ResultEx<()>,
     native_ctx : usize,
+    _lifetime : std::marker::PhantomData<&'a ()>,
 }
 
 /// PCIe TLP wrapper context - returned to the caller of the TLP enable function.
 pub struct LcTlpContextWrap<'a, T> {
     /// Access to the underlying context.
-    pub ctx     : &'a LcTlpContext::<'a, T>,
-    native      : *mut LcTlpContext::<'a, T>,
+    pub ctx     : Arc<LcTlpContext<'static, T>>,
+    _lifetime   : std::marker::PhantomData<&'a LeechCore>,
 }
 
 impl LeechCore {
@@ -4411,6 +4441,7 @@ impl LeechCore {
     pub const LC_CMD_MEMMAP_SET_STRUCT                  : u64 = 0x4000050000000000;
 
     /// Execute a command using the LcCommand interface.
+    /// Commands containing native pointers must use the dedicated typed APIs.
     /// 
     /// # Arguments
     /// * `command_id` - The command id to execute.
@@ -4465,7 +4496,8 @@ impl LeechCore {
     ///     println!("e_lfanew: {:x}", doshdr.e_lfanew);
     /// }
     /// ```
-    pub fn mem_read_as<T>(&self, pa : u64) -> ResultEx<T> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn mem_read_as<T : Pod>(&self, pa : u64) -> ResultEx<T> {
         return self.impl_mem_read_as(pa);
     }
 
@@ -4503,7 +4535,8 @@ impl LeechCore {
     /// let data_to_write = [0x56, 0x4d, 0x4d, 0x52, 0x55, 0x53, 0x54];
     /// let _r = lc.mem_write_as(0x1000, &data_to_write);
     /// ```
-    pub fn mem_write_as<T>(&self, pa : u64, data : &T) -> ResultEx<()> {
+    /// `T` must implement [`Pod`]; custom structs may derive [`Pod`] and [`Zeroable`].
+    pub fn mem_write_as<T : Pod>(&self, pa : u64, data : &T) -> ResultEx<()> {
         return self.impl_mem_write_as(pa, data);
     }
 
@@ -4554,7 +4587,7 @@ impl LeechCore {
     /// See [`LcBarContext`] for more information.
     /// 
     /// Only one PCIe BAR callback may be active at a time.
-    pub fn pcie_bar_callback<T>(&self, ctx : T, fn_bar_callback : fn(ctx : &LcBarContext<T>, req : &LcBarRequest) -> ResultEx<()>) -> ResultEx<LcBarContextWrap<T>> {
+    pub fn pcie_bar_callback<T : Send + Sync + 'static>(&self, ctx : T, fn_bar_callback : fn(ctx : &LcBarContext<T>, req : &LcBarRequest) -> ResultEx<()>) -> ResultEx<LcBarContextWrap<T>> {
         return self.impl_pcie_bar_callback(ctx, fn_bar_callback);
     }
 
@@ -4567,7 +4600,7 @@ impl LeechCore {
     /// See [`LcTlpContext`] for more information.
     /// 
     /// Only one PCIe TLP callback may be active at a time.
-    pub fn pcie_tlp_callback<T>(&self, ctx : T, fn_tlp_callback : fn(ctx : &LcTlpContext<T>, tlp : &[u8], tlp_str : &str) -> ResultEx<()>) -> ResultEx<LcTlpContextWrap<T>> {
+    pub fn pcie_tlp_callback<T : Send + Sync + 'static>(&self, ctx : T, fn_tlp_callback : fn(ctx : &LcTlpContext<T>, tlp : &[u8], tlp_str : &str) -> ResultEx<()>) -> ResultEx<LcTlpContextWrap<T>> {
         return self.impl_pcie_tlp_callback(ctx, fn_tlp_callback);
     }
 
@@ -4626,78 +4659,78 @@ struct VmmNative {
     library_lc : Option<libloading::Library>,
     library_vmm : Option<libloading::Library>,
     VMMDLL_Initialize :             extern "C" fn(argc: c_int, argv: *const *const c_char) -> usize,
-    VMMDLL_InitializePlugins :      extern "C" fn(hVMM : usize) -> bool,
+    VMMDLL_InitializePlugins :      extern "C" fn(hVMM : usize) -> c_int,
     VMMDLL_Close :                  extern "C" fn(hVMM : usize),
-    VMMDLL_ConfigGet :              extern "C" fn(hVMM : usize, fOption : u64, pqwValue : *mut u64) -> bool,
-    VMMDLL_ConfigSet :              extern "C" fn(hVMM : usize, fOption : u64, qwValue : u64) -> bool,
+    VMMDLL_ConfigGet :              extern "C" fn(hVMM : usize, fOption : u64, pqwValue : *mut u64) -> c_int,
+    VMMDLL_ConfigSet :              extern "C" fn(hVMM : usize, fOption : u64, qwValue : u64) -> c_int,
     VMMDLL_MemFree :                extern "C" fn(pvMem : usize),
     
     VMMDLL_Log :                    extern "C" fn(hVMM : usize, MID : u32, dwLogLevel : u32, uszFormat : *const c_char, uszParam : *const c_char),
-    VMMDLL_MemSearch :              extern "C" fn(hVMM : usize, pid : u32, ctx : *mut CVMMDLL_MEM_SEARCH_CONTEXT, ppva : *mut u64, pcva : *mut u32) -> bool,
-    VMMDLL_YaraSearch :             extern "C" fn(hVMM : usize, pid : u32, ctx : *mut CVMMDLL_YARA_CONFIG, ppva : *mut u64, pcva : *mut u32) -> bool,
+    VMMDLL_MemSearch :              extern "C" fn(hVMM : usize, pid : u32, ctx : *mut CVMMDLL_MEM_SEARCH_CONTEXT, ppva : *mut *mut u64, pcva : *mut u32) -> c_int,
+    VMMDLL_YaraSearch :             extern "C" fn(hVMM : usize, pid : u32, ctx : *mut CVMMDLL_YARA_CONFIG, ppva : *mut *mut u64, pcva : *mut u32) -> c_int,
 
-    VMMDLL_MemReadEx :              extern "C" fn(hVMM : usize, pid : u32, qwA : u64, pb : *mut u8, cb : u32, pcbReadOpt : *mut u32, flags : u64) -> bool,
-    VMMDLL_MemWrite :               extern "C" fn(hVMM : usize, pid : u32, qwA : u64, pb : *const u8, cb : u32) -> bool,
-    VMMDLL_MemVirt2Phys :           extern "C" fn(hVMM : usize, pid : u32, qwA : u64, pqwPA : *mut u64) -> bool,
+    VMMDLL_MemReadEx :              extern "C" fn(hVMM : usize, pid : u32, qwA : u64, pb : *mut u8, cb : u32, pcbReadOpt : *mut u32, flags : u64) -> c_int,
+    VMMDLL_MemWrite :               extern "C" fn(hVMM : usize, pid : u32, qwA : u64, pb : *const u8, cb : u32) -> c_int,
+    VMMDLL_MemVirt2Phys :           extern "C" fn(hVMM : usize, pid : u32, qwA : u64, pqwPA : *mut u64) -> c_int,
 
     VMMDLL_Scatter_Initialize :     extern "C" fn(hVMM : usize, pid : u32, flags : u32) -> usize,
-    VMMDLL_Scatter_Prepare :        extern "C" fn(hS : usize, va : u64, cb : u32) -> bool,
-    VMMDLL_Scatter_PrepareEx :      extern "C" fn(hS : usize, va : u64, cb : u32, pb : *mut u8, pcbRead : *mut u32) -> bool,
-    VMMDLL_Scatter_PrepareWrite :   extern "C" fn(hS : usize, va : u64, pb : *const u8, cb : u32) -> bool,
-    VMMDLL_Scatter_Execute :        extern "C" fn(hS : usize) -> bool,
-    VMMDLL_Scatter_Read :           extern "C" fn(hS : usize, va : u64, cb : u32, pb : *mut u8, pcbRead : *mut u32) -> bool,
-    VMMDLL_Scatter_Clear :          extern "C" fn(hS : usize, pid : u32, flags : u32) -> bool,
+    VMMDLL_Scatter_Prepare :        extern "C" fn(hS : usize, va : u64, cb : u32) -> c_int,
+    VMMDLL_Scatter_PrepareEx :      extern "C" fn(hS : usize, va : u64, cb : u32, pb : *mut u8, pcbRead : *mut u32) -> c_int,
+    VMMDLL_Scatter_PrepareWrite :   extern "C" fn(hS : usize, va : u64, pb : *const u8, cb : u32) -> c_int,
+    VMMDLL_Scatter_Execute :        extern "C" fn(hS : usize) -> c_int,
+    VMMDLL_Scatter_Read :           extern "C" fn(hS : usize, va : u64, cb : u32, pb : *mut u8, pcbRead : *mut u32) -> c_int,
+    VMMDLL_Scatter_Clear :          extern "C" fn(hS : usize, pid : u32, flags : u32) -> c_int,
     VMMDLL_Scatter_CloseHandle :    extern "C" fn(hS : usize),
 
-    VMMDLL_PidGetFromName :         extern "C" fn(hVMM : usize, szProcName : *const c_char, pdwPID : *mut u32) -> bool,
-    VMMDLL_PidList :                extern "C" fn(hVMM : usize, pPIDs : *mut u32, pcPIDs : *mut usize) -> bool,
+    VMMDLL_PidGetFromName :         extern "C" fn(hVMM : usize, szProcName : *const c_char, pdwPID : *mut u32) -> c_int,
+    VMMDLL_PidList :                extern "C" fn(hVMM : usize, pPIDs : *mut u32, pcPIDs : *mut usize) -> c_int,
 
-    VMMDLL_WinReg_HiveList :        extern "C" fn(hVMM : usize, pHives : *mut CRegHive, cHives : u32, pcHives : *mut u32) -> bool,
-    VMMDLL_WinReg_HiveReadEx :      extern "C" fn(hVMM : usize, vaCMHive : u64, ra : u32, pb : *mut u8, cb : u32, pcbReadOpt : *mut u32, flags : u64) -> bool,
-    VMMDLL_WinReg_HiveWrite :       extern "C" fn(hVMM : usize, vaCMHive : u64, ra : u32, pb : *const u8, cb : u32) -> bool,
-    VMMDLL_WinReg_EnumKeyExU :      extern "C" fn(hVMM : usize, uszFullPathKey : *const c_char, dwIndex : u32, lpcchName : *mut c_char, lpcchName : *mut u32, lpftLastWriteTime : *mut u64) -> bool,
-    VMMDLL_WinReg_EnumValueU :      extern "C" fn(hVMM : usize, uszFullPathKey : *const c_char, dwIndex : u32, lpValueName : *mut c_char, lpcchValueName : *mut u32, lpType : *mut u32, lpcbData : *mut u32) -> bool,
+    VMMDLL_WinReg_HiveList :        extern "C" fn(hVMM : usize, pHives : *mut CRegHive, cHives : u32, pcHives : *mut u32) -> c_int,
+    VMMDLL_WinReg_HiveReadEx :      extern "C" fn(hVMM : usize, vaCMHive : u64, ra : u32, pb : *mut u8, cb : u32, pcbReadOpt : *mut u32, flags : u64) -> c_int,
+    VMMDLL_WinReg_HiveWrite :       extern "C" fn(hVMM : usize, vaCMHive : u64, ra : u32, pb : *const u8, cb : u32) -> c_int,
+    VMMDLL_WinReg_EnumKeyExU :      extern "C" fn(hVMM : usize, uszFullPathKey : *const c_char, dwIndex : u32, lpcchName : *mut c_char, lpcchName : *mut u32, lpftLastWriteTime : *mut u64) -> c_int,
+    VMMDLL_WinReg_EnumValueU :      extern "C" fn(hVMM : usize, uszFullPathKey : *const c_char, dwIndex : u32, lpValueName : *mut c_char, lpcchValueName : *mut u32, lpType : *mut u32, lpData : *mut u8, lpcbData : *mut u32) -> c_int,
     VMMDLL_WinReg_QueryNameOriginalU : extern "C" fn(hVMM : usize, uszFullPath : *const c_char, fValue : c_int, uszName : *mut c_char, pcbName : *mut u32) -> c_int,
-    VMMDLL_WinReg_QueryValueExU :   extern "C" fn(hVMM : usize, uszFullPathKeyValue : *const c_char, lpType : *mut u32, lpData : *mut u8, lpcbData : *mut u32) -> bool,
+    VMMDLL_WinReg_QueryValueExU :   extern "C" fn(hVMM : usize, uszFullPathKeyValue : *const c_char, lpType : *mut u32, lpData : *mut u8, lpcbData : *mut u32) -> c_int,
 
     VMMDLL_ProcessGetModuleBaseU :  extern "C" fn(hVMM : usize, pid : u32, uszModuleName : *const c_char) -> u64,
     VMMDLL_ProcessGetProcAddressU : extern "C" fn(hVMM : usize, pid : u32, uszModuleName : *const c_char, szFunctionName : *const c_char) -> u64,
-    VMMDLL_ProcessGetInformation :  extern "C" fn(hVMM : usize, pid : u32, pProcessInformation : *mut CProcessInformation, pcbProcessInformation : *mut usize) -> bool,
+    VMMDLL_ProcessGetInformation :  extern "C" fn(hVMM : usize, pid : u32, pProcessInformation : *mut CProcessInformation, pcbProcessInformation : *mut usize) -> c_int,
     VMMDLL_ProcessGetInformationString : extern "C" fn(hVMM : usize, pid : u32, fOptionString : u32) -> *const c_char,
 
-    VMMDLL_Map_GetKDeviceU :        extern "C" fn(hVMM : usize, ppPoolMap : *mut *mut CKDeviceMap) -> bool,
-    VMMDLL_Map_GetKDriverU :        extern "C" fn(hVMM : usize, ppPoolMap : *mut *mut CKDriverMap) -> bool,
-    VMMDLL_Map_GetKObjectU :        extern "C" fn(hVMM : usize, ppPoolMap : *mut *mut CKObjectMap) -> bool,
-    VMMDLL_Map_GetNetU :            extern "C" fn(hVMM : usize, ppNetMap : *mut *mut CNetMap) -> bool,
-    VMMDLL_Map_GetPfnEx :           extern "C" fn(hVMM : usize, pPfns : *const u32, cPfns : u32, ppPfnMap : *mut *mut CPfnMap, flags : u32) -> bool,
-    VMMDLL_Map_GetPhysMem :         extern "C" fn(hVMM : usize, ppPhysMemMap : *mut *mut CMemoryMap) -> bool,
-    VMMDLL_Map_GetPool :            extern "C" fn(hVMM : usize, ppPoolMap : *mut *mut CPoolMap, flags : u32) -> bool,
-    VMMDLL_Map_GetServicesU :       extern "C" fn(hVMM : usize, ppServiceMap : *mut *mut CServiceMap) -> bool,
-    VMMDLL_Map_GetUsersU :          extern "C" fn(hVMM : usize, ppUserMap : *mut *mut CUserMap) -> bool,
-    VMMDLL_Map_GetVMU :             extern "C" fn(hVMM : usize, ppVmMap : *mut *mut CVmMap) -> bool,
+    VMMDLL_Map_GetKDeviceU :        extern "C" fn(hVMM : usize, ppPoolMap : *mut *mut CKDeviceMap) -> c_int,
+    VMMDLL_Map_GetKDriverU :        extern "C" fn(hVMM : usize, ppPoolMap : *mut *mut CKDriverMap) -> c_int,
+    VMMDLL_Map_GetKObjectU :        extern "C" fn(hVMM : usize, ppPoolMap : *mut *mut CKObjectMap) -> c_int,
+    VMMDLL_Map_GetNetU :            extern "C" fn(hVMM : usize, ppNetMap : *mut *mut CNetMap) -> c_int,
+    VMMDLL_Map_GetPfnEx :           extern "C" fn(hVMM : usize, pPfns : *const u32, cPfns : u32, ppPfnMap : *mut *mut CPfnMap, flags : u32) -> c_int,
+    VMMDLL_Map_GetPhysMem :         extern "C" fn(hVMM : usize, ppPhysMemMap : *mut *mut CMemoryMap) -> c_int,
+    VMMDLL_Map_GetPool :            extern "C" fn(hVMM : usize, ppPoolMap : *mut *mut CPoolMap, flags : u32) -> c_int,
+    VMMDLL_Map_GetServicesU :       extern "C" fn(hVMM : usize, ppServiceMap : *mut *mut CServiceMap) -> c_int,
+    VMMDLL_Map_GetUsersU :          extern "C" fn(hVMM : usize, ppUserMap : *mut *mut CUserMap) -> c_int,
+    VMMDLL_Map_GetVMU :             extern "C" fn(hVMM : usize, ppVmMap : *mut *mut CVmMap) -> c_int,
 
-    VMMDLL_PdbLoad :                extern "C" fn(hVMM : usize, dwPID : u32, vaModuleBase : u64, szModuleName : *mut c_char) -> bool,
-    VMMDLL_PdbSymbolName :          extern "C" fn(hVMM : usize, szModule : *const c_char, cbSymbolAddressOrOffset : u64, szSymbolName : *mut c_char, pdwSymbolDisplacement : *mut u32) -> bool,
-    VMMDLL_PdbSymbolAddress :       extern "C" fn(hVMM : usize, szModule : *const c_char, szSymbolName : *const c_char, pvaSymbolAddress : *mut u64) -> bool,
-    VMMDLL_PdbTypeSize :            extern "C" fn(hVMM : usize, szModule : *const c_char, szTypeName : *const c_char, pcbTypeSize : *mut u32) -> bool,
-    VMMDLL_PdbTypeChildOffset :     extern "C" fn(hVMM : usize, szModule : *const c_char, uszTypeName : *const c_char, uszTypeChildName : *const c_char, pcbTypeChildOffset : *mut u32) -> bool,
+    VMMDLL_PdbLoad :                extern "C" fn(hVMM : usize, dwPID : u32, vaModuleBase : u64, szModuleName : *mut c_char) -> c_int,
+    VMMDLL_PdbSymbolName :          extern "C" fn(hVMM : usize, szModule : *const c_char, cbSymbolAddressOrOffset : u64, szSymbolName : *mut c_char, pdwSymbolDisplacement : *mut u32) -> c_int,
+    VMMDLL_PdbSymbolAddress :       extern "C" fn(hVMM : usize, szModule : *const c_char, szSymbolName : *const c_char, pvaSymbolAddress : *mut u64) -> c_int,
+    VMMDLL_PdbTypeSize :            extern "C" fn(hVMM : usize, szModule : *const c_char, szTypeName : *const c_char, pcbTypeSize : *mut u32) -> c_int,
+    VMMDLL_PdbTypeChildOffset :     extern "C" fn(hVMM : usize, szModule : *const c_char, uszTypeName : *const c_char, uszTypeChildName : *const c_char, pcbTypeChildOffset : *mut u32) -> c_int,
 
-    VMMDLL_Map_GetEATU :            extern "C" fn(hVMM : usize, pid : u32, uszModuleName : *const c_char, ppEatMap : *mut *mut CEatMap) -> bool,
-    VMMDLL_Map_GetHandleU :         extern "C" fn(hVMM : usize, pid : u32, ppHandleMap : *mut *mut CHandleMap) -> bool,
-    VMMDLL_Map_GetHeap :            extern "C" fn(hVMM : usize, pid : u32, ppHeapMap : *mut *mut CHeapMap) -> bool,
-    VMMDLL_Map_GetHeapAlloc :       extern "C" fn(hVMM : usize, pid : u32, qwHeapNumOrAddress : u64, ppHeapAllocMap : *mut *mut CHeapAllocMap) -> bool,
-    VMMDLL_Map_GetIATU :            extern "C" fn(hVMM : usize, pid : u32, uszModuleName : *const c_char, ppIatMap : *mut *mut CIatMap) -> bool,
-    VMMDLL_Map_GetModuleU :         extern "C" fn(hVMM : usize, pid : u32, ppModuleMap : *mut *mut CModuleMap, flags : u32) -> bool,
-    VMMDLL_Map_GetPteU :            extern "C" fn(hVMM : usize, pid : u32, fIdentifyModules : bool, ppPteMap : *mut *mut CPteMap) -> bool,
-    VMMDLL_Map_GetThread :          extern "C" fn(hVMM : usize, pid : u32, ppThreadMap : *mut *mut CThreadMap) -> bool,
-    VMMDLL_Map_GetThreadCallstackU: extern "C" fn(hVMM : usize, pid : u32, tid : u32, flags : u32, ppThreadCallstack : *mut *mut CThreadCallstackMap) -> bool,
-    VMMDLL_Map_GetUnloadedModuleU : extern "C" fn(hVMM : usize, pid : u32, ppUnloadedModuleMap : *mut *mut CUnloadedModuleMap) -> bool,
-    VMMDLL_Map_GetVadU :            extern "C" fn(hVMM : usize, pid : u32, fIdentifyModules : bool, ppVadMap : *mut *mut CVadMap) -> bool,
-    VMMDLL_Map_GetVadEx :           extern "C" fn(hVMM : usize, pid : u32, oPage : u32, cPage : u32, ppVadExMap : *mut *mut CVadExMap) -> bool,
-    VMMDLL_ProcessGetDirectoriesU : extern "C" fn(hVMM : usize, pid : u32, uszModule : *const c_char, pDataDirectories : *mut CIMAGE_DATA_DIRECTORY) -> bool,
-    VMMDLL_ProcessGetSectionsU :    extern "C" fn(hVMM : usize, pid : u32, uszModule : *const c_char, pSections : *mut CIMAGE_SECTION_HEADER, cSections : u32, pcSections : *mut u32) -> bool,
+    VMMDLL_Map_GetEATU :            extern "C" fn(hVMM : usize, pid : u32, uszModuleName : *const c_char, ppEatMap : *mut *mut CEatMap) -> c_int,
+    VMMDLL_Map_GetHandleU :         extern "C" fn(hVMM : usize, pid : u32, ppHandleMap : *mut *mut CHandleMap) -> c_int,
+    VMMDLL_Map_GetHeap :            extern "C" fn(hVMM : usize, pid : u32, ppHeapMap : *mut *mut CHeapMap) -> c_int,
+    VMMDLL_Map_GetHeapAlloc :       extern "C" fn(hVMM : usize, pid : u32, qwHeapNumOrAddress : u64, ppHeapAllocMap : *mut *mut CHeapAllocMap) -> c_int,
+    VMMDLL_Map_GetIATU :            extern "C" fn(hVMM : usize, pid : u32, uszModuleName : *const c_char, ppIatMap : *mut *mut CIatMap) -> c_int,
+    VMMDLL_Map_GetModuleU :         extern "C" fn(hVMM : usize, pid : u32, ppModuleMap : *mut *mut CModuleMap, flags : u32) -> c_int,
+    VMMDLL_Map_GetPteU :            extern "C" fn(hVMM : usize, pid : u32, fIdentifyModules : c_int, ppPteMap : *mut *mut CPteMap) -> c_int,
+    VMMDLL_Map_GetThread :          extern "C" fn(hVMM : usize, pid : u32, ppThreadMap : *mut *mut CThreadMap) -> c_int,
+    VMMDLL_Map_GetThreadCallstackU: extern "C" fn(hVMM : usize, pid : u32, tid : u32, flags : u32, ppThreadCallstack : *mut *mut CThreadCallstackMap) -> c_int,
+    VMMDLL_Map_GetUnloadedModuleU : extern "C" fn(hVMM : usize, pid : u32, ppUnloadedModuleMap : *mut *mut CUnloadedModuleMap) -> c_int,
+    VMMDLL_Map_GetVadU :            extern "C" fn(hVMM : usize, pid : u32, fIdentifyModules : c_int, ppVadMap : *mut *mut CVadMap) -> c_int,
+    VMMDLL_Map_GetVadEx :           extern "C" fn(hVMM : usize, pid : u32, oPage : u32, cPage : u32, ppVadExMap : *mut *mut CVadExMap) -> c_int,
+    VMMDLL_ProcessGetDirectoriesU : extern "C" fn(hVMM : usize, pid : u32, uszModule : *const c_char, pDataDirectories : *mut CIMAGE_DATA_DIRECTORY) -> c_int,
+    VMMDLL_ProcessGetSectionsU :    extern "C" fn(hVMM : usize, pid : u32, uszModule : *const c_char, pSections : *mut CIMAGE_SECTION_HEADER, cSections : u32, pcSections : *mut u32) -> c_int,
 
-    VMMDLL_VfsListU :               extern "C" fn(hVMM : usize, uszPath : *const c_char, pFileList : *mut CVMMDLL_VFS_FILELIST2) -> bool,
+    VMMDLL_VfsListU :               extern "C" fn(hVMM : usize, uszPath : *const c_char, pFileList : *mut CVMMDLL_VFS_FILELIST2) -> c_int,
     VMMDLL_VfsReadU :               extern "C" fn(hVMM : usize, uszFileName : *const c_char, pb : *mut u8, cb : u32, pcbRead : *mut u32, cbOffset : u64) -> u32,
     VMMDLL_VfsWriteU :              extern "C" fn(hVMM : usize, uszFileName : *const c_char, pb : *const u8, cb : u32, pcbWrite : *mut u32, cbOffset : u64) -> u32,
 
@@ -4730,7 +4763,7 @@ fn impl_new<'a>(vmm_lib_path : &str, lc_existing_opt : Option<&LeechCore>, h_vmm
             .with_context(|| format!("Failed to load vmm library at: {}", str_path_vmm))?;
         // fetch function references:
         let VMMDLL_Initialize : extern "C" fn(argc: c_int, argv: *const *const c_char) -> usize = *lib.get(b"VMMDLL_Initialize")?;
-        let VMMDLL_InitializePlugins : extern "C" fn(usize) -> bool = *lib.get(b"VMMDLL_InitializePlugins")?;
+        let VMMDLL_InitializePlugins : extern "C" fn(usize) -> c_int = *lib.get(b"VMMDLL_InitializePlugins")?;
         let VMMDLL_Close = *lib.get(b"VMMDLL_Close")?;
         let VMMDLL_ConfigGet = *lib.get(b"VMMDLL_ConfigGet")?;
         let VMMDLL_ConfigSet = *lib.get(b"VMMDLL_ConfigSet")?;
@@ -4816,7 +4849,7 @@ fn impl_new<'a>(vmm_lib_path : &str, lc_existing_opt : Option<&LeechCore>, h_vmm
             if h == 0 {
                 return Err(anyhow!("VMMDLL_Initialize: fail"));
             }
-            let r = (VMMDLL_InitializePlugins)(h);
+            let r = (VMMDLL_InitializePlugins)(h) != 0;
             if !r {
                 return Err(anyhow!("VMMDLL_InitializePlugins: fail"));
             }
@@ -4931,7 +4964,8 @@ fn impl_new_from_virtual_machine<'a>(vmm_parent : &'a Vmm, vm_entry : &VmmMapVir
         return Err(anyhow!("VMMDLL_VmGetVmmHandle: fail."));
     }
     let native = VmmNative {
-        h: vmm_parent.native.h,
+        h: h_vmm_vm,
+        is_close_h : true,
         library_lc : None,
         library_vmm : None,
         ..vmm_parent.native
@@ -5019,11 +5053,7 @@ impl Drop for Vmm<'_> {
 
 impl Clone for Vmm<'_> {
     fn clone(&self) -> Self {
-        let vmmid = self.get_config(CONFIG_OPT_CORE_VMM_ID).unwrap();
-        let vmmid_str = vmmid.to_string();
-        let vmm_clone_args = ["-create-from-vmmid", &vmmid_str].to_vec();
-        let vmm_clone = Vmm::new(&self.path_vmm, &vmm_clone_args).unwrap();
-        return vmm_clone;
+        return self.impl_clone_owned().unwrap();
     }
 }
 
@@ -5196,9 +5226,9 @@ struct CVmEntry {
     uszName : *const c_char,
     gpaMax : u64,
     tp : u32,
-    fActive : bool,
-    fReadOnly : bool,
-    fPhysicalOnly : bool,
+    fActive : u32,
+    fReadOnly : u32,
+    fPhysicalOnly : u32,
     dwPartitionID : u32,
     dwVersionBuild : u32,
     tpSystem : u32,
@@ -5337,12 +5367,12 @@ struct CNetMapEntry {
     dwState : u32,
     _FutureUse3 : [u16; 3],
     AF : u16,
-    src_fValid : bool,
+    src_fValid : u32,
     src__Reserved : u16,
     src_port : u16,
     src_pbAddr : [u8; 16],
     src_uszText : *const c_char,
-    dst_fValid : bool,
+    dst_fValid : u32,
     dst__Reserved : u16,
     dst_port : u16,
     dst_pbAddr : [u8; 16],
@@ -5481,6 +5511,13 @@ struct CPoolMap {
 
 #[repr(C)]
 #[allow(non_snake_case)]
+union CNativeString {
+    usz : *const c_char,
+    _padding : u64,
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
 struct CServiceEntry {
     vaObj : u64,
     dwOrdinal : u32,
@@ -5492,12 +5529,12 @@ struct CServiceEntry {
     dwServiceSpecificExitCode : u32,
     dwCheckPoint : u32,
     wWaitHint : u32,
-    uszServiceName : *const c_char,
-    uszDisplayName : *const c_char,
-    uszPath : *const c_char,
-    uszUserTp : *const c_char,
-    uszUserAcct : *const c_char,
-    uszImagePath : *const c_char,
+    uszServiceName : CNativeString,
+    uszDisplayName : CNativeString,
+    uszPath : CNativeString,
+    uszUserTp : CNativeString,
+    uszUserAcct : CNativeString,
+    uszImagePath : CNativeString,
     dwPID : u32,
     _FutureUse1 : u32,
     _FutureUse2 : u64,
@@ -5627,8 +5664,9 @@ macro_rules! impl_map_get {
     ($native:expr, $structs:ident, $version_const:expr, |$ne:ident| $convert:block) => {{
         unsafe {
             if (*$structs).dwVersion != $version_const {
+                let version = (*$structs).dwVersion;
                 ($native.VMMDLL_MemFree)($structs as usize);
-                return Err(anyhow!("bad version [{} != {}].", (*$structs).dwVersion, $version_const));
+                return Err(anyhow!("bad version [{} != {}].", version, $version_const));
             }
             let mut result = Vec::new();
             if (*$structs).cMap == 0 {
@@ -5636,7 +5674,7 @@ macro_rules! impl_map_get {
                 return Ok(result);
             }
             let cMap: usize = (*$structs).cMap.try_into()?;
-            let pMap = std::slice::from_raw_parts(&(*$structs).pMap, cMap);
+            let pMap = std::slice::from_raw_parts(std::ptr::addr_of!((*$structs).pMap), cMap);
             for i in 0..cMap {
                 let $ne = &pMap[i];
                 result.push($convert);
@@ -5649,6 +5687,11 @@ macro_rules! impl_map_get {
 
 #[allow(non_snake_case)]
 impl Vmm<'_> {
+    fn impl_clone_owned(&self) -> ResultEx<Vmm<'static>> {
+        let vmmid = self.get_config(CONFIG_OPT_CORE_VMM_ID)?.to_string();
+        return Vmm::new(&self.path_vmm, &vec!["-create-from-vmmid", &vmmid]);
+    }
+
     fn impl_get_leechcore(&self) -> ResultEx<LeechCore> {
         let lc_handle = self.get_config(CONFIG_OPT_CORE_LEECHCORE_HANDLE)?;
         let lc_lib_path = self.path_lc.as_str();
@@ -5673,12 +5716,12 @@ impl Vmm<'_> {
 
     fn impl_get_config(&self, config_id : u64) -> ResultEx<u64> {
         let mut v = 0;
-        let f = (self.native.VMMDLL_ConfigGet)(self.native.h, config_id, &mut v);
+        let f = (self.native.VMMDLL_ConfigGet)(self.native.h, config_id, &mut v) != 0;
         return if f { Ok(v) } else { Err(anyhow!("VMMDLL_ConfigGet: fail")) };
     }
 
     fn impl_set_config(&self, config_id : u64, config_value : u64) -> ResultEx<()> {
-        let f = (self.native.VMMDLL_ConfigSet)(self.native.h, config_id, config_value);
+        let f = (self.native.VMMDLL_ConfigSet)(self.native.h, config_id, config_value) != 0;
         return if f { Ok(()) } else { Err(anyhow!("VMMDLL_ConfigSet: fail")) };
     }
 
@@ -5697,7 +5740,7 @@ impl Vmm<'_> {
     fn impl_process_from_name(&self, process_name : &str) -> ResultEx<VmmProcess> {
         let mut pid = 0;
         let sz_process_name = CString::new(process_name)?;
-        let r = (self.native.VMMDLL_PidGetFromName)(self.native.h, sz_process_name.as_ptr(), &mut pid);
+        let r = (self.native.VMMDLL_PidGetFromName)(self.native.h, sz_process_name.as_ptr(), &mut pid) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_PidGetFromName: fail. Process '{process_name}' does not exist."));
         }
@@ -5709,12 +5752,12 @@ impl Vmm<'_> {
 
     fn impl_process_list(&self) -> ResultEx<Vec<VmmProcess>> {
         let mut cpids : usize = 0;
-        let r = (self.native.VMMDLL_PidList)(self.native.h, std::ptr::null_mut(), &mut cpids);
+        let r = (self.native.VMMDLL_PidList)(self.native.h, std::ptr::null_mut(), &mut cpids) != 0;
         if !r || cpids > 0x00100000 {
             return Err(anyhow!("VMMDLL_PidList: fail."));
         }
         let mut pids = vec![0u32; cpids];
-        let r = (self.native.VMMDLL_PidList)(self.native.h, pids.as_mut_ptr(), &mut cpids);
+        let r = (self.native.VMMDLL_PidList)(self.native.h, pids.as_mut_ptr(), &mut cpids) != 0;
         if !r || cpids > 0x00100000 {
             return Err(anyhow!("VMMDLL_PidList: fail."));
         }
@@ -5731,7 +5774,7 @@ impl Vmm<'_> {
     fn impl_map_pfn(&self, pfns : &Vec<u32>, is_extended : bool) -> ResultEx<Vec<VmmMapPfnEntry>> {
         let mut structs = std::ptr::null_mut();
         let flags = if is_extended { 1 } else { 0 };
-        let r = (self.native.VMMDLL_Map_GetPfnEx)(self.native.h, pfns.as_ptr(), u32::try_from(pfns.len())?, &mut structs, flags);
+        let r = (self.native.VMMDLL_Map_GetPfnEx)(self.native.h, pfns.as_ptr(), u32::try_from(pfns.len())?, &mut structs, flags) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetPfnEx: fail."));
         }
@@ -5754,7 +5797,7 @@ impl Vmm<'_> {
 
     fn impl_map_memory(&self) -> ResultEx<Vec<VmmMapMemoryEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.native.VMMDLL_Map_GetPhysMem)(self.native.h, &mut structs);
+        let r = (self.native.VMMDLL_Map_GetPhysMem)(self.native.h, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetPhysMem: fail."));
         }
@@ -5768,7 +5811,7 @@ impl Vmm<'_> {
 
     fn impl_map_net(&self) -> ResultEx<Vec<VmmMapNetEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.native.VMMDLL_Map_GetNetU)(self.native.h, &mut structs);
+        let r = (self.native.VMMDLL_Map_GetNetU)(self.native.h, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetNetU: fail."));
         }
@@ -5777,11 +5820,11 @@ impl Vmm<'_> {
                 pid : ne.dwPID,
                 state : ne.dwState,
                 address_family : ne.AF,
-                src_is_valid : ne.src_fValid,
+                src_is_valid : ne.src_fValid != 0,
                 src_port : ne.src_port,
                 src_addr_raw : ne.src_pbAddr,
                 src_str : cstr_to_string(ne.src_uszText),
-                dst_is_valid : ne.dst_fValid,
+                dst_is_valid : ne.dst_fValid != 0,
                 dst_port : ne.dst_port,
                 dst_addr_raw : ne.dst_pbAddr,
                 dst_str : cstr_to_string(ne.dst_uszText),
@@ -5795,7 +5838,7 @@ impl Vmm<'_> {
 
     fn impl_map_kdevice(&self) -> ResultEx<Vec<VmmMapKDeviceEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.native.VMMDLL_Map_GetKDeviceU)(self.native.h, &mut structs);
+        let r = (self.native.VMMDLL_Map_GetKDeviceU)(self.native.h, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetKDeviceU: fail."));
         }
@@ -5815,7 +5858,7 @@ impl Vmm<'_> {
 
     fn impl_map_kdriver(&self) -> ResultEx<Vec<VmmMapKDriverEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.native.VMMDLL_Map_GetKDriverU)(self.native.h, &mut structs);
+        let r = (self.native.VMMDLL_Map_GetKDriverU)(self.native.h, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetKDriverU: fail."));
         }
@@ -5835,7 +5878,7 @@ impl Vmm<'_> {
 
     fn impl_map_kobject(&self) -> ResultEx<Vec<VmmMapKObjectEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.native.VMMDLL_Map_GetKObjectU)(self.native.h, &mut structs);
+        let r = (self.native.VMMDLL_Map_GetKObjectU)(self.native.h, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetKObjectU: fail."));
         }
@@ -5859,7 +5902,7 @@ impl Vmm<'_> {
     fn impl_map_pool(&self, is_bigpool_only : bool) -> ResultEx<Vec<VmmMapPoolEntry>> {
         let mut structs = std::ptr::null_mut();
         let flags = if is_bigpool_only { 1 } else { 0 };
-        let r = (self.native.VMMDLL_Map_GetPool)(self.native.h, &mut structs, flags);
+        let r = (self.native.VMMDLL_Map_GetPool)(self.native.h, &mut structs, flags) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetPool: fail."));
         }
@@ -5877,7 +5920,7 @@ impl Vmm<'_> {
 
     fn impl_map_service(&self) -> ResultEx<Vec<VmmMapServiceEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.native.VMMDLL_Map_GetServicesU)(self.native.h, &mut structs);
+        let r = (self.native.VMMDLL_Map_GetServicesU)(self.native.h, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetServicesU: fail."));
         }
@@ -5894,19 +5937,19 @@ impl Vmm<'_> {
                 service_specific_exit_code : ne.dwServiceSpecificExitCode,
                 check_point : ne.dwCheckPoint,
                 wait_hint : ne.wWaitHint,
-                name : cstr_to_string(ne.uszServiceName),
-                name_display : cstr_to_string(ne.uszDisplayName),
-                path : cstr_to_string(ne.uszPath),
-                user_type : cstr_to_string(ne.uszUserTp),
-                user_account : cstr_to_string(ne.uszUserAcct),
-                image_path : cstr_to_string(ne.uszImagePath),
+                name : cstr_to_string(ne.uszServiceName.usz),
+                name_display : cstr_to_string(ne.uszDisplayName.usz),
+                path : cstr_to_string(ne.uszPath.usz),
+                user_type : cstr_to_string(ne.uszUserTp.usz),
+                user_account : cstr_to_string(ne.uszUserAcct.usz),
+                image_path : cstr_to_string(ne.uszImagePath.usz),
             }
         })
     }
 
     fn impl_map_user(&self) -> ResultEx<Vec<VmmMapUserEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.native.VMMDLL_Map_GetUsersU)(self.native.h, &mut structs);
+        let r = (self.native.VMMDLL_Map_GetUsersU)(self.native.h, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetUsersU: fail."));
         }
@@ -5921,7 +5964,7 @@ impl Vmm<'_> {
 
     fn impl_map_virtual_machine(&self) -> ResultEx<Vec<VmmMapVirtualMachineEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.native.VMMDLL_Map_GetVMU)(self.native.h, &mut structs);
+        let r = (self.native.VMMDLL_Map_GetVMU)(self.native.h, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetVMU: fail."));
         }
@@ -5932,9 +5975,9 @@ impl Vmm<'_> {
                 name : cstr_to_string(ne.uszName),
                 gpa_max : ne.gpaMax,
                 tp_vm : ne.tp,
-                is_active : ne.fActive,
-                is_readonly : ne.fReadOnly,
-                is_physicalonly : ne.fPhysicalOnly,
+                is_active : ne.fActive != 0,
+                is_readonly : ne.fReadOnly != 0,
+                is_physicalonly : ne.fPhysicalOnly != 0,
                 partition_id : ne.dwPartitionID,
                 guest_os_version_build : ne.dwVersionBuild,
                 guest_tp_system : ne.tpSystem,
@@ -5948,7 +5991,7 @@ impl Vmm<'_> {
         let cb = u32::try_from(size)?;
         let mut cb_read = 0;
         let mut pb_result = vec![0u8; size];
-        let r = (self.native.VMMDLL_MemReadEx)(self.native.h, pid, va, pb_result.as_mut_ptr(), cb, &mut cb_read, flags);
+        let r = (self.native.VMMDLL_MemReadEx)(self.native.h, pid, va, pb_result.as_mut_ptr(), cb, &mut cb_read, flags) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_MemReadEx: fail."));
         }
@@ -5958,24 +6001,22 @@ impl Vmm<'_> {
     fn impl_mem_read_into(&self, pid : u32, va : u64, flags : u64, data : &mut [u8]) -> ResultEx<usize> {
         let cb = u32::try_from(data.len())?;
         let mut cb_read = 0;
-        let r = (self.native.VMMDLL_MemReadEx)(self.native.h, pid, va, data.as_mut_ptr(), cb, &mut cb_read, flags);
+        let r = (self.native.VMMDLL_MemReadEx)(self.native.h, pid, va, data.as_mut_ptr(), cb, &mut cb_read, flags) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_MemReadEx: fail."));
         }
         return Ok(cb_read as usize);
     }
 
-    fn impl_mem_read_as<T>(&self, pid : u32, va : u64, flags : u64) -> ResultEx<T> {
-        unsafe {
-            let cb = u32::try_from(std::mem::size_of::<T>())?;
-            let mut cb_read = 0;
-            let mut result : T = std::mem::zeroed();
-            let r = (self.native.VMMDLL_MemReadEx)(self.native.h, pid, va, &mut result as *mut _ as *mut u8, cb, &mut cb_read, flags);
-            if !r {
-                return Err(anyhow!("VMMDLL_MemReadEx: fail."));
-            }
-            return Ok(result);
+    fn impl_mem_read_as<T : Pod>(&self, pid : u32, va : u64, flags : u64) -> ResultEx<T> {
+        let cb = u32::try_from(std::mem::size_of::<T>())?;
+        let mut cb_read = 0;
+        let mut result = T::zeroed();
+        let r = (self.native.VMMDLL_MemReadEx)(self.native.h, pid, va, &mut result as *mut _ as *mut u8, cb, &mut cb_read, flags) != 0;
+        if !r {
+            return Err(anyhow!("VMMDLL_MemReadEx: fail."));
         }
+        return Ok(result);
     }
 
     fn impl_mem_scatter(&self, pid : u32, flags : u64) -> ResultEx<VmmScatterMemory> {
@@ -5995,7 +6036,7 @@ impl Vmm<'_> {
 
     fn impl_mem_virt2phys(&self, pid : u32, va : u64) -> ResultEx<u64> {
         let mut pa : u64 = 0;
-        let r = (self.native.VMMDLL_MemVirt2Phys)(self.native.h, pid, va, &mut pa);
+        let r = (self.native.VMMDLL_MemVirt2Phys)(self.native.h, pid, va, &mut pa) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_MemVirt2Phys: fail."));
         }
@@ -6005,16 +6046,16 @@ impl Vmm<'_> {
     fn impl_mem_write(&self, pid : u32, va : u64, data : &[u8]) -> ResultEx<()> {
         let cb = u32::try_from(data.len())?;
         let pb = data.as_ptr();
-        let r = (self.native.VMMDLL_MemWrite)(self.native.h, pid, va, pb, cb);
+        let r = (self.native.VMMDLL_MemWrite)(self.native.h, pid, va, pb, cb) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_MemWrite: fail."));
         }
         return Ok(());
     }
 
-    fn impl_mem_write_as<T>(&self, pid : u32, va : u64, data : &T) -> ResultEx<()> {
+    fn impl_mem_write_as<T : Pod>(&self, pid : u32, va : u64, data : &T) -> ResultEx<()> {
         let cb = u32::try_from(std::mem::size_of::<T>())?;
-        let r = (self.native.VMMDLL_MemWrite)(self.native.h, pid, va, data as *const _ as *const u8, cb);
+        let r = (self.native.VMMDLL_MemWrite)(self.native.h, pid, va, data as *const _ as *const u8, cb) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_MemWrite: fail."));
         }
@@ -6031,7 +6072,7 @@ impl Vmm<'_> {
             pfnAddDirectory : vfs_list_adddirectory_cb,
             h : ptr_result,
         };
-        let r = (self.native.VMMDLL_VfsListU)(self.native.h, c_path.as_ptr(), &mut filelist2);
+        let r = (self.native.VMMDLL_VfsListU)(self.native.h, c_path.as_ptr(), &mut filelist2) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_VfsListU: fail."));
         }
@@ -6063,7 +6104,7 @@ impl Vmm<'_> {
     fn impl_reg_hive_list(&self) -> ResultEx<Vec<VmmRegHive>> {
         unsafe {
             let mut cHives = 0;
-            let r = (self.native.VMMDLL_WinReg_HiveList)(self.native.h, std::ptr::null_mut(), 0, &mut cHives);
+            let r = (self.native.VMMDLL_WinReg_HiveList)(self.native.h, std::ptr::null_mut(), 0, &mut cHives) != 0;
             if !r {
                 return Err(anyhow!("VMMDLL_WinReg_HiveList: fail."));
             }
@@ -6073,7 +6114,7 @@ impl Vmm<'_> {
             let size = std::mem::size_of::<CRegHive>();
             let mut bytes = vec![0u8; size * cHives as usize];
             let ptr = bytes.as_mut_ptr() as *mut CRegHive;
-            let r = (self.native.VMMDLL_WinReg_HiveList)(self.native.h, ptr, cHives, &mut cHives);
+            let r = (self.native.VMMDLL_WinReg_HiveList)(self.native.h, ptr, cHives, &mut cHives) != 0;
             if !r {
                 return Err(anyhow!("VMMDLL_WinReg_HiveList: fail."));
             }
@@ -6133,7 +6174,7 @@ impl Vmm<'_> {
         let mut ftLastWrite = 0;
         let mut cch = 0;
         let c_path = CString::new(path)?;
-        let r = (self.native.VMMDLL_WinReg_EnumKeyExU)(self.native.h, c_path.as_ptr(), u32::MAX, std::ptr::null_mut(), &mut cch, &mut ftLastWrite);
+        let r = (self.native.VMMDLL_WinReg_EnumKeyExU)(self.native.h, c_path.as_ptr(), u32::MAX, std::ptr::null_mut(), &mut cch, &mut ftLastWrite) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_WinReg_EnumKeyExU: fail."));
         }
@@ -6153,14 +6194,14 @@ impl Vmm<'_> {
         let mut v = [0u8; 64];
         let mut raw_size = v.len() as u32;
         let c_path = CString::new(path)?;
-        let r = (self.native.VMMDLL_WinReg_QueryValueExU)(self.native.h, c_path.as_ptr(), &mut raw_type, v.as_mut_ptr(), &mut raw_size);
+        let r = (self.native.VMMDLL_WinReg_QueryValueExU)(self.native.h, c_path.as_ptr(), &mut raw_type, v.as_mut_ptr(), &mut raw_size) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_WinReg_QueryValueExU: fail."));
         }
         if raw_size < v.len() as u32 {
             raw_value = Some(v[0..raw_size as usize].to_vec());
         } else {
-            let r = (self.native.VMMDLL_WinReg_QueryValueExU)(self.native.h, c_path.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), &mut raw_size);
+            let r = (self.native.VMMDLL_WinReg_QueryValueExU)(self.native.h, c_path.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), &mut raw_size) != 0;
             if !r {
                 return Err(anyhow!("VMMDLL_WinReg_QueryValueExU: fail."));
             }
@@ -6213,7 +6254,7 @@ impl VmmPdb<'_> {
         let c_module = CString::new(self.module.as_str())?;
         let mut c_symbol_name = [0 as c_char; MAX_PATH];
         let mut result_symbol_displacement = 0;
-        let r = (self.vmm.native.VMMDLL_PdbSymbolName)(self.vmm.native.h, c_module.as_ptr(), va_or_offset, c_symbol_name.as_mut_ptr(), &mut result_symbol_displacement);
+        let r = (self.vmm.native.VMMDLL_PdbSymbolName)(self.vmm.native.h, c_module.as_ptr(), va_or_offset, c_symbol_name.as_mut_ptr(), &mut result_symbol_displacement) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_PdbSymbolName: fail."));
         }
@@ -6225,7 +6266,7 @@ impl VmmPdb<'_> {
         let c_module = CString::new(self.module.as_str())?;
         let c_symbol_name = CString::new(symbol_name)?;
         let mut result = 0;
-        let r = (self.vmm.native.VMMDLL_PdbSymbolAddress)(self.vmm.native.h, c_module.as_ptr(), c_symbol_name.as_ptr(), &mut result);
+        let r = (self.vmm.native.VMMDLL_PdbSymbolAddress)(self.vmm.native.h, c_module.as_ptr(), c_symbol_name.as_ptr(), &mut result) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_PdbSymbolAddress: fail."));
         }
@@ -6236,7 +6277,7 @@ impl VmmPdb<'_> {
         let c_module = CString::new(self.module.as_str())?;
         let c_type_name = CString::new(type_name)?;
         let mut result = 0;
-        let r = (self.vmm.native.VMMDLL_PdbTypeSize)(self.vmm.native.h, c_module.as_ptr(), c_type_name.as_ptr(), &mut result);
+        let r = (self.vmm.native.VMMDLL_PdbTypeSize)(self.vmm.native.h, c_module.as_ptr(), c_type_name.as_ptr(), &mut result) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_PdbTypeSize: fail."));
         }
@@ -6248,7 +6289,7 @@ impl VmmPdb<'_> {
         let c_type_name = CString::new(type_name)?;
         let c_type_child_name = CString::new(type_child_name)?;
         let mut result = 0;
-        let r = (self.vmm.native.VMMDLL_PdbTypeChildOffset)(self.vmm.native.h, c_module.as_ptr(), c_type_name.as_ptr(), c_type_child_name.as_ptr(), &mut result);
+        let r = (self.vmm.native.VMMDLL_PdbTypeChildOffset)(self.vmm.native.h, c_module.as_ptr(), c_type_name.as_ptr(), c_type_child_name.as_ptr(), &mut result) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_PdbTypeChildOffset: fail."));
         }
@@ -6326,7 +6367,7 @@ impl VmmRegHive<'_> {
         let cb = u32::try_from(size)?;
         let mut cb_read = 0;
         let mut pb_result = vec![0u8; size];
-        let r = (self.vmm.native.VMMDLL_WinReg_HiveReadEx)(self.vmm.native.h, self.va, ra, pb_result.as_mut_ptr(), cb, &mut cb_read, flags);
+        let r = (self.vmm.native.VMMDLL_WinReg_HiveReadEx)(self.vmm.native.h, self.va, ra, pb_result.as_mut_ptr(), cb, &mut cb_read, flags) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_WinReg_HiveReadEx: fail."));
         }
@@ -6336,7 +6377,7 @@ impl VmmRegHive<'_> {
     fn impl_reg_hive_write(&self, ra : u32, data : &[u8]) -> ResultEx<()> {
         let cb = u32::try_from(data.len())?;
         let pb = data.as_ptr();
-        let r = (self.vmm.native.VMMDLL_WinReg_HiveWrite)(self.vmm.native.h, self.va, ra, pb, cb);
+        let r = (self.vmm.native.VMMDLL_WinReg_HiveWrite)(self.vmm.native.h, self.va, ra, pb, cb) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_WinReg_HiveWrite: fail."));
         }
@@ -6362,7 +6403,7 @@ impl VmmRegKey<'_> {
             let mut result = Vec::new();
             loop {
                 cch = data.len() as u32 - 1;
-                let r = (self.vmm.native.VMMDLL_WinReg_EnumKeyExU)(self.vmm.native.h, c_path.as_ptr(), i, data.as_mut_ptr(), &mut cch, &mut ft_last_write);
+                let r = (self.vmm.native.VMMDLL_WinReg_EnumKeyExU)(self.vmm.native.h, c_path.as_ptr(), i, data.as_mut_ptr(), &mut cch, &mut ft_last_write) != 0;
                 if !r {
                     break;
                 }
@@ -6404,7 +6445,7 @@ impl VmmRegValue<'_> {
             let mut raw_value = vec![0; self.raw_size as usize];
             let c_path = CString::new(self.path.clone())?;
             let mut raw_size = self.raw_size;
-            let r = (self.vmm.native.VMMDLL_WinReg_QueryValueExU)(self.vmm.native.h, c_path.as_ptr(), std::ptr::null_mut(), raw_value.as_mut_ptr(), &mut raw_size);
+            let r = (self.vmm.native.VMMDLL_WinReg_QueryValueExU)(self.vmm.native.h, c_path.as_ptr(), std::ptr::null_mut(), raw_value.as_mut_ptr(), &mut raw_size) != 0;
             if !r {
                 return Err(anyhow!("VMMDLL_WinReg_QueryValueExU: fail."));
             }
@@ -6723,7 +6764,7 @@ struct CProcessInformation {
     wSize : u16,
     tpMemoryModel : u32,
     tpSystem : u32,
-    fUserOnly : bool,
+    fUserOnly : u32,
     dwPID : u32,
     dwPPID : u32,
     dwState : u32,
@@ -6734,7 +6775,7 @@ struct CProcessInformation {
     vaEPROCESS : u64,
     vaPEB : u64,
     _Reserved1 : u64,
-    fWow64 : bool,
+    fWow64 : u32,
     vaPEB32 : u32,
     dwSessionId : u32,
     qwLUID : u64,
@@ -6811,7 +6852,7 @@ struct CHandleEntry {
     dwPID : u32,
     dwPoolTag : u32,
     _FutureUse : [u32; 7],
-    uszType : *const c_char,
+    uszType : CNativeString,
 }
 
 #[repr(C)]
@@ -6830,7 +6871,7 @@ struct CHandleMap {
 struct CHeapEntry {
     va : u64,
     tp : u32,
-    f32 : bool,
+    f32 : u32,
     iHeap : u32,
     dwHeapNum : u32,
 }
@@ -6872,7 +6913,7 @@ struct CIatEntry {
     _FutureUse1 : u32,
     _FutureUse2 : u32,
     uszModule : *const c_char,
-    thunk_f32 : bool,
+    thunk_f32 : u32,
     thunk_wHint : u16,
     thunk__Reserved1 : u16,
     thunk_rvaFirstThunk : u32,
@@ -6922,7 +6963,7 @@ struct CModuleEntry {
     vaBase : u64,
     vaEntry : u64,
     cbImageSize : u32,
-    fWoW64 : bool,
+    fWoW64 : u32,
     uszText : *const c_char,
     _Reserved3 : u32,
     _Reserved4 : u32,
@@ -6955,7 +6996,7 @@ struct CPteEntry {
     vaBase : u64,
     cPages : u64,
     fPage : u64,
-    fWoW64 : bool,
+    fWoW64 : u32,
     _FutureUse1 : u32,
     uszText : *const c_char,
     _Reserved1 : u32,
@@ -7019,7 +7060,7 @@ struct CThreadMap {
 #[allow(non_snake_case)]
 struct CThreadCallstackEntry {
     i : u32,
-    fRegPresent : bool,
+    fRegPresent : u32,
     vaRetAddr : u64,
     vaRSP : u64,
     vaBaseSP : u64,
@@ -7049,7 +7090,7 @@ struct CThreadCallstackMap {
 struct CUnloadedModuleEntry {
     vaBase : u64,
     cbImageSize : u32,
-    fWoW64 : bool,
+    fWoW64 : u32,
     uszText : *const c_char,
     _FutureUse1 : u32,
     dwCheckSum : u32,
@@ -7138,7 +7179,7 @@ impl VmmProcess<'_> {
             wSize : u16::try_from(cb_pi)?,
             tpMemoryModel : 0,
             tpSystem : 0,
-            fUserOnly : false,
+            fUserOnly : 0,
             dwPID : 0,
             dwPPID : 0,
             dwState : 0,
@@ -7149,7 +7190,7 @@ impl VmmProcess<'_> {
             vaEPROCESS : 0,
             vaPEB : 0,
             _Reserved1 : 0,
-            fWow64 : false,
+            fWow64 : 0,
             vaPEB32 : 0,
             dwSessionId : 0,
             qwLUID : 0,
@@ -7157,14 +7198,14 @@ impl VmmProcess<'_> {
             IntegrityLevel : 0,
         };
         let raw_pi = &mut pi as *mut CProcessInformation;
-        let r = (self.vmm.native.VMMDLL_ProcessGetInformation)(self.vmm.native.h, self.pid, raw_pi, &mut cb_pi);
+        let r = (self.vmm.native.VMMDLL_ProcessGetInformation)(self.vmm.native.h, self.pid, raw_pi, &mut cb_pi) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_ProcessGetInformation: fail."));
         }
         let result = VmmProcessInfo {
             tp_system : VmmSystemType::from(pi.tpSystem),
             tp_memorymodel : VmmMemoryModelType::from(pi.tpMemoryModel),
-            is_user_mode : pi.fUserOnly,
+            is_user_mode : pi.fUserOnly != 0,
             pid : pi.dwPID,
             ppid : pi.dwPPID,
             state : pi.dwState,
@@ -7174,7 +7215,7 @@ impl VmmProcess<'_> {
             pa_dtb_user : pi.paDTB_UserOpt,
             va_eprocess : pi.vaEPROCESS,
             va_peb : pi.vaPEB,
-            is_wow64 : pi.fWow64,
+            is_wow64 : pi.fWow64 != 0,
             va_peb32 : pi.vaPEB32,
             session_id : pi.dwSessionId,
             luid : pi.qwLUID,
@@ -7220,7 +7261,7 @@ impl VmmProcess<'_> {
 
     fn impl_pdb_from_module_address(&self, va_module_base : u64) -> ResultEx<VmmPdb> {
         let mut szModuleName = [0i8; MAX_PATH + 1];
-        let r = (self.vmm.native.VMMDLL_PdbLoad)(self.vmm.native.h, self.pid, va_module_base, szModuleName.as_mut_ptr() as *mut c_char);
+        let r = (self.vmm.native.VMMDLL_PdbLoad)(self.vmm.native.h, self.pid, va_module_base, szModuleName.as_mut_ptr() as *mut c_char) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_PdbLoad: fail."));
         }
@@ -7234,7 +7275,7 @@ impl VmmProcess<'_> {
 
     fn impl_map_handle(&self) -> ResultEx<Vec<VmmProcessMapHandleEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetHandleU)(self.vmm.native.h, self.pid, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetHandleU)(self.vmm.native.h, self.pid, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetHandleU: fail."));
         }
@@ -7252,14 +7293,14 @@ impl VmmProcess<'_> {
                 handle_pid : ne.dwPID,
                 pool_tag : ne.dwPoolTag,
                 info : cstr_to_string(ne.uszText),
-                tp : cstr_to_string(ne.uszType),
+                tp : cstr_to_string(ne.uszType.usz),
             }
         })
     }
 
     fn impl_map_heap(&self) -> ResultEx<Vec<VmmProcessMapHeapEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetHeap)(self.vmm.native.h, self.pid, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetHeap)(self.vmm.native.h, self.pid, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetHeap: fail."));
         }
@@ -7267,7 +7308,7 @@ impl VmmProcess<'_> {
             VmmProcessMapHeapEntry {
                 pid : self.pid,
                 tp : VmmProcessMapHeapType::from(ne.tp),
-                is_32 : ne.f32,
+                is_32 : ne.f32 != 0,
                 index : ne.iHeap,
                 number : ne.dwHeapNum,
             }
@@ -7276,7 +7317,7 @@ impl VmmProcess<'_> {
 
     fn impl_map_heapalloc(&self, heap_number_or_address : u64) -> ResultEx<Vec<VmmProcessMapHeapAllocEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetHeapAlloc)(self.vmm.native.h, self.pid, heap_number_or_address, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetHeapAlloc)(self.vmm.native.h, self.pid, heap_number_or_address, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetHeapAlloc: fail."));
         }
@@ -7293,7 +7334,7 @@ impl VmmProcess<'_> {
     fn impl_map_module(&self, is_info_debug : bool, is_info_version : bool) -> ResultEx<Vec<VmmProcessMapModuleEntry>> {
         let mut structs = std::ptr::null_mut();
         let flags = 0 + if is_info_debug { 1 } else { 0 } + if is_info_version { 2 } else { 0 };
-        let r = (self.vmm.native.VMMDLL_Map_GetModuleU)(self.vmm.native.h, self.pid, &mut structs, flags);
+        let r = (self.vmm.native.VMMDLL_Map_GetModuleU)(self.vmm.native.h, self.pid, &mut structs, flags) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetModuleU: fail."));
         }
@@ -7329,7 +7370,7 @@ impl VmmProcess<'_> {
                 va_base : ne.vaBase,
                 va_entry : ne.vaEntry,
                 image_size : ne.cbImageSize,
-                is_wow64 : ne.fWoW64,
+                is_wow64 : ne.fWoW64 != 0,
                 tp : VmmProcessMapModuleType::from(ne.tp),
                 name : cstr_to_string(ne.uszText),
                 full_name : cstr_to_string(ne.uszFullName),
@@ -7346,7 +7387,7 @@ impl VmmProcess<'_> {
     fn impl_map_module_eat(&self, module_name : &str) -> ResultEx<Vec<VmmProcessMapEatEntry>> {
         let mut structs = std::ptr::null_mut();
         let sz_module_name = CString::new(module_name)?;
-        let r = (self.vmm.native.VMMDLL_Map_GetEATU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetEATU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetEATU: fail."));
         }
@@ -7364,7 +7405,7 @@ impl VmmProcess<'_> {
     fn impl_map_module_iat(&self, module_name : &str) -> ResultEx<Vec<VmmProcessMapIatEntry>> {
         let mut structs = std::ptr::null_mut();
         let sz_module_name = CString::new(module_name)?;
-        let r = (self.vmm.native.VMMDLL_Map_GetIATU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetIATU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetIATU: fail."));
         }
@@ -7380,7 +7421,7 @@ impl VmmProcess<'_> {
 
     fn impl_map_pte(&self, is_identify_modules : bool) -> ResultEx<Vec<VmmProcessMapPteEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetPteU)(self.vmm.native.h, self.pid, is_identify_modules, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetPteU)(self.vmm.native.h, self.pid, is_identify_modules as c_int, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetPteU: fail."));
         }
@@ -7394,7 +7435,7 @@ impl VmmProcess<'_> {
                 is_w : (ne.fPage & 0x0000000000000002) != 0,
                 is_x : (ne.fPage & 0x8000000000000000) == 0,
                 is_s : (ne.fPage & 0x0000000000000004) == 0,
-                is_wow64 : ne.fWoW64,
+                is_wow64 : ne.fWoW64 != 0,
                 info : cstr_to_string(ne.uszText),
             }
         })
@@ -7402,7 +7443,7 @@ impl VmmProcess<'_> {
 
     fn impl_map_thread(&self) -> ResultEx<Vec<VmmProcessMapThreadEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetThread)(self.vmm.native.h, self.pid, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetThread)(self.vmm.native.h, self.pid, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetThread: fail."));
         }
@@ -7441,7 +7482,7 @@ impl VmmProcess<'_> {
 
     fn impl_map_thread_callstack(&self, tid : u32, flags : u32) -> ResultEx<Vec<VmmProcessMapThreadCallstackEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetThreadCallstackU)(self.vmm.native.h, self.pid, tid, flags, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetThreadCallstackU)(self.vmm.native.h, self.pid, tid, flags, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetThreadCallstackU: fail."));
         }
@@ -7450,7 +7491,7 @@ impl VmmProcess<'_> {
                 pid : self.pid,
                 tid : tid,
                 i : ne.i,
-                is_reg_present : ne.fRegPresent,
+                is_reg_present : ne.fRegPresent != 0,
                 va_ret_addr : ne.vaRetAddr,
                 va_rsp : ne.vaRSP,
                 va_base_sp : ne.vaBaseSP,
@@ -7463,7 +7504,7 @@ impl VmmProcess<'_> {
 
     fn impl_map_unloaded_module(&self) -> ResultEx<Vec<VmmProcessMapUnloadedModuleEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetUnloadedModuleU)(self.vmm.native.h, self.pid, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetUnloadedModuleU)(self.vmm.native.h, self.pid, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetUnloadedModuleU: fail."));
         }
@@ -7472,7 +7513,7 @@ impl VmmProcess<'_> {
                 pid : self.pid,
                 va_base : ne.vaBase,
                 image_size : ne.cbImageSize,
-                is_wow64 : ne.fWoW64,
+                is_wow64 : ne.fWoW64 != 0,
                 name : cstr_to_string(ne.uszText),
                 checksum : ne.dwCheckSum,
                 timedatestamp : ne.dwTimeDateStamp,
@@ -7483,7 +7524,7 @@ impl VmmProcess<'_> {
 
     fn impl_map_vad(&self, is_identify_modules : bool) -> ResultEx<Vec<VmmProcessMapVadEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetVadU)(self.vmm.native.h, self.pid, is_identify_modules, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetVadU)(self.vmm.native.h, self.pid, is_identify_modules as c_int, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetVadU: fail."));
         }
@@ -7511,7 +7552,7 @@ impl VmmProcess<'_> {
 
     fn impl_map_vadex(&self, offset_pages : u32, count_pages : u32) -> ResultEx<Vec<VmmProcessMapVadExEntry>> {
         let mut structs = std::ptr::null_mut();
-        let r = (self.vmm.native.VMMDLL_Map_GetVadEx)(self.vmm.native.h, self.pid, offset_pages, count_pages, &mut structs);
+        let r = (self.vmm.native.VMMDLL_Map_GetVadEx)(self.vmm.native.h, self.pid, offset_pages, count_pages, &mut structs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Map_GetVadEx: fail."));
         }
@@ -7535,7 +7576,7 @@ impl VmmProcess<'_> {
     fn impl_map_module_data_directory(&self, module_name : &str) -> ResultEx<Vec<VmmProcessMapDirectoryEntry>> {
         let sz_module_name = CString::new(module_name)?;
         let mut data_directories = vec![CIMAGE_DATA_DIRECTORY::default(); 16];
-        let r = (self.vmm.native.VMMDLL_ProcessGetDirectoriesU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), data_directories.as_mut_ptr());
+        let r = (self.vmm.native.VMMDLL_ProcessGetDirectoriesU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), data_directories.as_mut_ptr()) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_ProcessGetDirectoriesU: fail."));
         }
@@ -7556,7 +7597,7 @@ impl VmmProcess<'_> {
     fn impl_map_module_section(&self, module_name : &str) -> ResultEx<Vec<VmmProcessSectionEntry>> {
         let sz_module_name = CString::new(module_name)?;
         let mut section_count = 0u32;
-        let r = (self.vmm.native.VMMDLL_ProcessGetSectionsU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), std::ptr::null_mut(), 0, &mut section_count);
+        let r = (self.vmm.native.VMMDLL_ProcessGetSectionsU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), std::ptr::null_mut(), 0, &mut section_count) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_ProcessGetSectionsU: fail."));
         }
@@ -7565,7 +7606,7 @@ impl VmmProcess<'_> {
         if section_count == 0 {
             return Ok(result);
         }
-        let r = (self.vmm.native.VMMDLL_ProcessGetSectionsU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), sections.as_mut_ptr(), section_count, &mut section_count);
+        let r = (self.vmm.native.VMMDLL_ProcessGetSectionsU)(self.vmm.native.h, self.pid, sz_module_name.as_ptr(), sections.as_mut_ptr(), section_count, &mut section_count) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_ProcessGetSectionsU: fail."));
         }
@@ -7623,7 +7664,7 @@ impl <'a> VmmScatterMemory<'a> {
             return Err(anyhow!("data_to_read.2 not set to zero"));
         }
         let cb = u32::try_from(data_to_read.1.len())?;
-        let r = (self.vmm.native.VMMDLL_Scatter_PrepareEx)(self.hs, data_to_read.0, cb, data_to_read.1.as_mut_ptr(), &mut data_to_read.2);
+        let r = (self.vmm.native.VMMDLL_Scatter_PrepareEx)(self.hs, data_to_read.0, cb, data_to_read.1.as_mut_ptr(), &mut data_to_read.2) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_PrepareEx: fail."));
         }
@@ -7631,12 +7672,12 @@ impl <'a> VmmScatterMemory<'a> {
         return Ok(());
     }
 
-    fn impl_prepare_ex_as<T>(&mut self, data_to_read : &'a mut (u64, T, u32)) -> ResultEx<()> {
+    fn impl_prepare_ex_as<T : Pod>(&mut self, data_to_read : &'a mut (u64, T, u32)) -> ResultEx<()> {
         if data_to_read.2 != 0 {
             return Err(anyhow!("data_to_read.2 not set to zero"));
         }
         let cb = u32::try_from(std::mem::size_of::<T>())?;
-        let r = (self.vmm.native.VMMDLL_Scatter_PrepareEx)(self.hs, data_to_read.0, cb, &mut data_to_read.1 as *mut _ as *mut u8, &mut data_to_read.2);
+        let r = (self.vmm.native.VMMDLL_Scatter_PrepareEx)(self.hs, data_to_read.0, cb, &mut data_to_read.1 as *mut _ as *mut u8, &mut data_to_read.2) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_PrepareEx: fail."));
         }
@@ -7648,7 +7689,7 @@ impl <'a> VmmScatterMemory<'a> {
 impl VmmScatterMemory<'_> {
     fn impl_prepare(&self, va : u64, size : usize) -> ResultEx<()> {
         let cb = u32::try_from(size)?;
-        let r = (self.vmm.native.VMMDLL_Scatter_Prepare)(self.hs, va, cb);
+        let r = (self.vmm.native.VMMDLL_Scatter_Prepare)(self.hs, va, cb) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_Prepare: fail."));
         }
@@ -7658,16 +7699,16 @@ impl VmmScatterMemory<'_> {
     fn impl_prepare_write(&self, va : u64, data : &[u8]) -> ResultEx<()> {
         let cb = u32::try_from(data.len())?;
         let pb = data.as_ptr();
-        let r = (self.vmm.native.VMMDLL_Scatter_PrepareWrite)(self.hs, va, pb, cb);
+        let r = (self.vmm.native.VMMDLL_Scatter_PrepareWrite)(self.hs, va, pb, cb) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_PrepareWrite: fail."));
         }
         return Ok(());
     }
 
-    fn impl_prepare_write_as<T>(&self, va : u64, data : &T) -> ResultEx<()> {
+    fn impl_prepare_write_as<T : Pod>(&self, va : u64, data : &T) -> ResultEx<()> {
         let cb = u32::try_from(std::mem::size_of::<T>())?;
-        let r = (self.vmm.native.VMMDLL_Scatter_PrepareWrite)(self.hs, va, data as *const _ as *const u8, cb);
+        let r = (self.vmm.native.VMMDLL_Scatter_PrepareWrite)(self.hs, va, data as *const _ as *const u8, cb) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_PrepareWrite: fail."));
         }
@@ -7675,7 +7716,7 @@ impl VmmScatterMemory<'_> {
     }
 
     fn impl_execute(&self) -> ResultEx<()> {
-        let r = (self.vmm.native.VMMDLL_Scatter_Execute)(self.hs);
+        let r = (self.vmm.native.VMMDLL_Scatter_Execute)(self.hs) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_Execute: fail."));
         }
@@ -7686,30 +7727,28 @@ impl VmmScatterMemory<'_> {
         let cb = u32::try_from(size)?;
         let mut cb_read = 0;
         let mut pb_result = vec![0u8; size];
-        let r = (self.vmm.native.VMMDLL_Scatter_Read)(self.hs, va, cb, pb_result.as_mut_ptr(), &mut cb_read);
+        let r = (self.vmm.native.VMMDLL_Scatter_Read)(self.hs, va, cb, pb_result.as_mut_ptr(), &mut cb_read) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_Read: fail."));
         }
         return Ok(pb_result);
     }
 
-    fn impl_read_as<T>(&self, va : u64) -> ResultEx<T> {
-        unsafe {
-            let cb = u32::try_from(std::mem::size_of::<T>())?;
-            let mut cb_read = 0;
-            let mut result : T = std::mem::zeroed();
-            let r = (self.vmm.native.VMMDLL_Scatter_Read)(self.hs, va, cb, &mut result as *mut _ as *mut u8, &mut cb_read);
-            if !r {
-                return Err(anyhow!("VMMDLL_Scatter_Read: fail."));
-            }
-            return Ok(result);
+    fn impl_read_as<T : Pod>(&self, va : u64) -> ResultEx<T> {
+        let cb = u32::try_from(std::mem::size_of::<T>())?;
+        let mut cb_read = 0;
+        let mut result = T::zeroed();
+        let r = (self.vmm.native.VMMDLL_Scatter_Read)(self.hs, va, cb, &mut result as *mut _ as *mut u8, &mut cb_read) != 0;
+        if !r {
+            return Err(anyhow!("VMMDLL_Scatter_Read: fail."));
         }
+        return Ok(result);
     }
 
     fn impl_read_into(&self, va : u64, data : &mut [u8]) -> ResultEx<usize> {
         let cb = u32::try_from(data.len())?;
         let mut cb_read = 0;
-        let r = (self.vmm.native.VMMDLL_Scatter_Read)(self.hs, va, cb, data.as_mut_ptr(), &mut cb_read);
+        let r = (self.vmm.native.VMMDLL_Scatter_Read)(self.hs, va, cb, data.as_mut_ptr(), &mut cb_read) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_Read: fail."));
         }
@@ -7717,7 +7756,7 @@ impl VmmScatterMemory<'_> {
     }
 
     fn impl_clear(&self) -> ResultEx<()> {
-        let r = (self.vmm.native.VMMDLL_Scatter_Clear)(self.hs, self.pid, self.flags);
+        let r = (self.vmm.native.VMMDLL_Scatter_Clear)(self.hs, self.pid, self.flags) != 0;
         if !r {
             return Err(anyhow!("VMMDLL_Scatter_Clear: fail."));
         }
@@ -7761,7 +7800,7 @@ struct CVMMDLL_MEM_SEARCH_CONTEXT_SEARCHENTRY {
 
 #[repr(C)]
 #[allow(non_snake_case, non_camel_case_types)]
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct CVMMDLL_MEM_SEARCH_CONTEXT {
     dwVersion : u32,
     _Filler : [u32; 2],
@@ -7792,48 +7831,74 @@ impl Drop for VmmSearch<'_> {
     }
 }
 
-// The below implementation is quite ugly, but it works since all methods are
-// serialized since they all require &mut self. Under no conditions should the
-// VmmSearch struct be accessed directly or non-mutable.
+#[derive(Debug, Default, Clone, Copy)]
+struct VmmSearchProgress {
+    addr_min : u64,
+    addr_max : u64,
+    addr_current : u64,
+    total_read_bytes : u64,
+    total_results : u32,
+}
+
+#[derive(Debug)]
+struct VmmSearchShared<T> {
+    abort : AtomicBool,
+    data : Mutex<(VmmSearchProgress, Vec<T>)>,
+}
+
+impl<T> VmmSearchShared<T> {
+    fn new(addr_min : u64, addr_max : u64) -> Self {
+        let progress = VmmSearchProgress { addr_min, addr_max, ..VmmSearchProgress::default() };
+        return Self { abort : AtomicBool::new(false), data : Mutex::new((progress, Vec::new())) };
+    }
+}
+
 impl VmmSearch<'_> {
     fn impl_result(&mut self) -> VmmSearchResult {
         if self.is_started == false {
             self.impl_start();
         }
         if self.is_completed == false {
-            self.is_completed = true;
             if let Some(thread) = self.thread.take() {
                 if let Ok(thread_result) = thread.join() {
                     self.is_completed_success = thread_result;
                 }
             }
+            self.is_completed = true;
         }
         return self.impl_poll();
     }
 
     fn impl_abort(&mut self) {
         if self.is_started && !self.is_completed {
-            self.native_search.fAbortRequested = 1;
+            self.shared.abort.store(true, Ordering::Relaxed);
         }
     }
 
     fn impl_start(&mut self) {
         if self.is_started == false {
             self.is_started = true;
-            // ugly code below - but it works ...
-            self.native_search.cSearch = self.search_terms.len() as u32;
-            self.native_search.pSearch = self.search_terms.as_ptr() as usize;
-            self.native_search.pvUserPtrOpt = std::ptr::addr_of!(self.result) as usize;
+            let vmm = match self.vmm.impl_clone_owned() {
+                Ok(vmm) => vmm,
+                Err(_) => { self.is_completed = true; return; },
+            };
             let pid = self.pid;
-            let native_h = self.vmm.native.h;
-            let pfn = self.vmm.native.VMMDLL_MemSearch;
-            let ptr = &mut self.native_search as *mut CVMMDLL_MEM_SEARCH_CONTEXT;
-            let ptr_wrap = ptr as usize;
-            let thread_handle = std::thread::spawn(move || {
-                let ptr = ptr_wrap as *mut CVMMDLL_MEM_SEARCH_CONTEXT;
-                (pfn)(native_h, pid, ptr, std::ptr::null_mut(), std::ptr::null_mut())
+            let mut native = self.native_search;
+            let search_terms = std::mem::take(&mut self.search_terms);
+            let shared = Arc::clone(&self.shared);
+            let thread_handle = std::thread::Builder::new().spawn(move || {
+                native.cSearch = search_terms.len() as u32;
+                native.pSearch = search_terms.as_ptr() as usize;
+                native.pvUserPtrOpt = Arc::as_ptr(&shared) as usize;
+                native.fAbortRequested = shared.abort.load(Ordering::Relaxed) as u32;
+                let r = (vmm.native.VMMDLL_MemSearch)(vmm.native.h, pid, &mut native, std::ptr::null_mut(), std::ptr::null_mut());
+                VmmSearch::impl_publish_progress(&native, &shared);
+                return r != 0 && !shared.abort.load(Ordering::Relaxed);
             });
-            self.thread = Some(thread_handle);
+            match thread_handle {
+                Ok(thread) => self.thread = Some(thread),
+                Err(_) => self.is_completed = true,
+            }
         }
     }
 
@@ -7841,16 +7906,17 @@ impl VmmSearch<'_> {
         if self.is_started && !self.is_completed && self.thread.as_ref().unwrap().is_finished() {
             return self.impl_result();
         }
-        let result_vec = if self.is_completed_success { self.result.clone() } else { Vec::new() };
+        let data = self.shared.data.lock().unwrap_or_else(|e| e.into_inner());
+        let result_vec = if self.is_completed_success { data.1.clone() } else { Vec::new() };
         return VmmSearchResult {
             is_started : self.is_started,
             is_completed : self.is_completed,
             is_completed_success : self.is_completed_success,
-            addr_min : self.native_search.vaMin,
-            addr_max : self.native_search.vaMax,
-            addr_current : self.native_search.vaCurrent,
-            total_read_bytes : self.native_search.cbReadTotal,
-            total_results : self.native_search.cResult,
+            addr_min : data.0.addr_min,
+            addr_max : data.0.addr_max,
+            addr_current : data.0.addr_current,
+            total_read_bytes : data.0.total_read_bytes,
+            total_results : data.0.total_results,
             result : result_vec,
         }
     }
@@ -7862,15 +7928,14 @@ impl VmmSearch<'_> {
         if addr_max != 0 && addr_max <= addr_min {
             return Err(anyhow!("search max address must be larger than min address"));
         }
-        let result_vec = Vec::new();
         let mut native_search = CVMMDLL_MEM_SEARCH_CONTEXT::default();
         native_search.dwVersion = VMMDLL_MEM_SEARCH_VERSION;
         native_search.vaMin = addr_min;
         native_search.vaMax = addr_max;
         native_search.ReadFlags = flags;
         native_search.cMaxResult = num_results_max;
-        native_search.pfnResultOptCB = VmmSearch::impl_search_cb as usize;
-        native_search.pvUserPtrOpt = std::ptr::addr_of!(result_vec) as usize;
+        native_search.pfnResultOptCB = VmmSearch::impl_search_cb as *const () as usize;
+        native_search.pfnFilterOptCB = VmmSearch::impl_filter_cb as *const () as usize;
         return Ok(VmmSearch {
             vmm,
             pid,
@@ -7880,7 +7945,7 @@ impl VmmSearch<'_> {
             native_search,
             search_terms : Vec::new(),
             thread : None,
-            result : result_vec,
+            shared : Arc::new(VmmSearchShared::new(addr_min, addr_max)),
         });
     }
 
@@ -7916,12 +7981,35 @@ impl VmmSearch<'_> {
         return Ok(result_index);
     }
 
-    extern "C" fn impl_search_cb(ctx : usize, va : u64, i_search : u32) -> bool {
+    fn impl_publish_progress(ctx : &CVMMDLL_MEM_SEARCH_CONTEXT, shared : &VmmSearchShared<(u64, u32)>) {
+        let mut data = shared.data.lock().unwrap_or_else(|e| e.into_inner());
+        data.0 = VmmSearchProgress {
+            addr_min : ctx.vaMin,
+            addr_max : ctx.vaMax,
+            addr_current : ctx.vaCurrent,
+            total_read_bytes : ctx.cbReadTotal,
+            total_results : ctx.cResult,
+        };
+    }
+
+    extern "C" fn impl_filter_cb(ctx : *mut CVMMDLL_MEM_SEARCH_CONTEXT, _pte : usize, _vad : usize) -> c_int {
         unsafe {
-            let ctx = ctx as *const CVMMDLL_MEM_SEARCH_CONTEXT;
-            let ptr_result_vec = (*ctx).pvUserPtrOpt as *mut Vec<(u64, u32)>;
-            (*ptr_result_vec).push((va, i_search));
-            return true;
+            let shared = &*((*ctx).pvUserPtrOpt as *const VmmSearchShared<(u64, u32)>);
+            VmmSearch::impl_publish_progress(&*ctx, shared);
+            if shared.abort.load(Ordering::Relaxed) {
+                (*ctx).fAbortRequested = 1;
+                return 0;
+            }
+            return 1;
+        }
+    }
+
+    extern "C" fn impl_search_cb(ctx : *mut CVMMDLL_MEM_SEARCH_CONTEXT, va : u64, i_search : u32) -> c_int {
+        unsafe {
+            if VmmSearch::impl_filter_cb(ctx, 0, 0) == 0 { return 0; }
+            let shared = &*((*ctx).pvUserPtrOpt as *const VmmSearchShared<(u64, u32)>);
+            shared.data.lock().unwrap_or_else(|e| e.into_inner()).1.push((va, i_search));
+            return 1;
         }
     }
 }
@@ -7993,7 +8081,7 @@ struct CVMMDLL_VMMYARA_RULE_MATCH {
 
 #[repr(C)]
 #[allow(non_snake_case, non_camel_case_types)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct CVMMDLL_YARA_CONFIG {
     dwVersion : u32,
     _Filler : [u32; 2],
@@ -8026,47 +8114,66 @@ impl Drop for VmmYara<'_> {
     }
 }
 
-// The below implementation is quite ugly, but it works since all methods are
-// serialized since they all require &mut self. Under no conditions should the
-// VmmYara struct be accessed directly or non-mutable.
 impl VmmYara<'_> {
     fn impl_result(&mut self) -> VmmYaraResult {
         if self.is_started == false {
             self.impl_start();
         }
         if self.is_completed == false {
-            self.is_completed = true;
             if let Some(thread) = self.thread.take() {
                 if let Ok(thread_result) = thread.join() {
                     self.is_completed_success = thread_result;
                 }
             }
+            self.is_completed = true;
         }
         return self.impl_poll();
     }
 
     fn impl_abort(&mut self) {
         if self.is_started && !self.is_completed {
-            self.native.fAbortRequested = 1;
+            self.shared.abort.store(true, Ordering::Relaxed);
         }
     }
 
     fn impl_start(&mut self) {
         if self.is_started == false {
             self.is_started = true;
-            // ugly code below - but it works ...
-            self.native.pvUserPtrOpt2 = std::ptr::addr_of!(self.result) as usize;
-            self.native.pvUserPtrOpt = std::ptr::addr_of!(self.native) as usize;
+            let vmm = match self.vmm.impl_clone_owned() {
+                Ok(vmm) => vmm,
+                Err(_) => { self.is_completed = true; return; },
+            };
             let pid = self.pid;
-            let native_h = self.vmm.native.h;
-            let pfn = self.vmm.native.VMMDLL_YaraSearch;
-            let ptr = &mut self.native as *mut CVMMDLL_YARA_CONFIG;
-            let ptr_wrap = ptr as usize;
-            let thread_handle = std::thread::spawn(move || {
-                let ptr = ptr_wrap as *mut CVMMDLL_YARA_CONFIG;
-                (pfn)(native_h, pid, ptr, std::ptr::null_mut(), std::ptr::null_mut())
+            let (addr_min, addr_max, limit, flags) = (self.native.vaMin, self.native.vaMax, self.native.cMaxResult, self.native.ReadFlags);
+            let rules = std::mem::take(&mut self._native_args_rules);
+            self._native_argv_rules.clear();
+            self.native.pszRules = std::ptr::null();
+            let shared = Arc::clone(&self.shared);
+            let thread_handle = std::thread::Builder::new().spawn(move || {
+                let argv : Vec<*const c_char> = rules.iter().map(|s| s.as_ptr()).collect();
+                let mut native = CVMMDLL_YARA_CONFIG {
+                    dwVersion : VMMDLL_YARA_CONFIG_VERSION,
+                    fAbortRequested : shared.abort.load(Ordering::Relaxed) as u32,
+                    cMaxResult : limit,
+                    cRules : argv.len() as u32,
+                    pszRules : argv.as_ptr(),
+                    vaMin : addr_min,
+                    vaMax : addr_max,
+                    ReadFlags : flags,
+                    pvUserPtrOpt2 : Arc::as_ptr(&shared) as usize,
+                    pfnScanMemoryCB : VmmYara::impl_yara_cb as *const () as usize,
+                    pfnFilterOptCB : VmmYara::impl_filter_cb as *const () as usize,
+                    ..CVMMDLL_YARA_CONFIG::default()
+                };
+                native.pvUserPtrOpt = std::ptr::addr_of!(native) as usize;
+                let r = (vmm.native.VMMDLL_YaraSearch)(vmm.native.h, pid, &mut native, std::ptr::null_mut(), std::ptr::null_mut());
+                VmmYara::impl_publish_progress(&native, &shared);
+                return r != 0 && !shared.abort.load(Ordering::Relaxed);
             });
-            self.thread = Some(thread_handle);
+            match thread_handle {
+                Ok(thread) => self.thread = Some(thread),
+                Err(_) => self.is_completed = true,
+            }
         }
     }
 
@@ -8074,15 +8181,16 @@ impl VmmYara<'_> {
         if self.is_started && !self.is_completed && self.thread.as_ref().unwrap().is_finished() {
             return self.impl_result();
         }
-        let result_vec = if self.is_completed_success { self.result.clone() } else { Vec::new() };
+        let data = self.shared.data.lock().unwrap_or_else(|e| e.into_inner());
+        let result_vec = if self.is_completed_success { data.1.clone() } else { Vec::new() };
         return VmmYaraResult {
             is_completed : self.is_completed,
             is_completed_success : self.is_completed_success,
-            addr_min : self.native.vaMin,
-            addr_max : self.native.vaMax,
-            addr_current : self.native.vaCurrent,
-            total_read_bytes : self.native.cbReadTotal,
-            total_results : self.result.len() as u32,
+            addr_min : data.0.addr_min,
+            addr_max : data.0.addr_max,
+            addr_current : data.0.addr_current,
+            total_read_bytes : data.0.total_read_bytes,
+            total_results : data.1.len() as u32,
             result : result_vec,
         }
     }
@@ -8131,19 +8239,43 @@ impl VmmYara<'_> {
             _native_args_rules : native_args_rules,
             _native_argv_rules : native_argv_rules,
             thread : None,
-            result : Vec::new(),
+            shared : Arc::new(VmmSearchShared::new(addr_min, addr_max)),
         };
         return Ok(yara);
     }
 
-    extern "C" fn impl_yara_cb(ctx : *const CVMMDLL_YARA_CONFIG, yrm : *const CVMMDLL_VMMYARA_RULE_MATCH, _pb_buffer : *const u8, _cb_buffer : usize) -> bool {
+    fn impl_publish_progress(ctx : &CVMMDLL_YARA_CONFIG, shared : &VmmSearchShared<VmmYaraMatch>) {
+        let mut data = shared.data.lock().unwrap_or_else(|e| e.into_inner());
+        data.0 = VmmSearchProgress {
+            addr_min : ctx.vaMin,
+            addr_max : ctx.vaMax,
+            addr_current : ctx.vaCurrent,
+            total_read_bytes : ctx.cbReadTotal,
+            total_results : ctx.cResult,
+        };
+    }
+
+    extern "C" fn impl_filter_cb(ctx : *mut CVMMDLL_YARA_CONFIG, _pte : usize, _vad : usize) -> c_int {
+        unsafe {
+            let shared = &*((*ctx).pvUserPtrOpt2 as *const VmmSearchShared<VmmYaraMatch>);
+            VmmYara::impl_publish_progress(&*ctx, shared);
+            if shared.abort.load(Ordering::Relaxed) {
+                (*ctx).fAbortRequested = 1;
+                return 0;
+            }
+            return 1;
+        }
+    }
+
+    extern "C" fn impl_yara_cb(ctx : *mut CVMMDLL_YARA_CONFIG, yrm : *const CVMMDLL_VMMYARA_RULE_MATCH, _pb_buffer : *const u8, _cb_buffer : usize) -> c_int {
         unsafe {
             if (*ctx).dwVersion != VMMDLL_YARA_CONFIG_VERSION {
-                return false;
+                return 0;
             }
             if (*yrm).dwVersion != VMMYARA_RULE_MATCH_VERSION {
-                return false;
+                return 0;
             }
+            if VmmYara::impl_filter_cb(ctx, 0, 0) == 0 { return 0; }
             let addr = (*ctx).vaCurrent;
             // rule:
             let rule = cstr_to_string((*yrm).szRuleIdentifier);
@@ -8187,9 +8319,9 @@ impl VmmYara<'_> {
                 meta,
                 match_strings,
             };
-            let ptr_result_vec = (*ctx).pvUserPtrOpt2 as *mut Vec<VmmYaraMatch>;
-            (*ptr_result_vec).push(yara_match);
-            return true;    
+            let shared = &*((*ctx).pvUserPtrOpt2 as *const VmmSearchShared<VmmYaraMatch>);
+            shared.data.lock().unwrap_or_else(|e| e.into_inner()).1.push(yara_match);
+            return 1;
         }
     }
 }
@@ -8251,10 +8383,10 @@ struct CVMMDLL_PLUGIN_REGINFO<T> {
     tpMemoryModel : u32,
     tpSystem : u32,
     hDLL : usize,
-    pfnPluginManager_Register : extern "C" fn(H : usize, pPluginRegInfo : *mut CVMMDLL_PLUGIN_REGINFO<T>) -> bool,
+    pfnPluginManager_Register : extern "C" fn(H : usize, pPluginRegInfo : *mut CVMMDLL_PLUGIN_REGINFO<T>) -> c_int,
     uszPathVmmDLL : *const c_char,
     _Reserved : [u32; 30],
-    Py_fPythonStandalone : bool,
+    Py_fPythonStandalone : u32,
     Py__Reserved : u32,
     Py_hReservedDllPython3 : usize,
     Py_hReservedDllPython3X : usize,
@@ -8270,12 +8402,12 @@ struct CVMMDLL_PLUGIN_REGINFO<T> {
     reg_info_uszTimelineFile : [u8; 32],
     reg_info__Reserved2 : [u8; 32],
     // reg_fn:
-    reg_fn_pfnList : extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>, pFileList : usize) -> bool,
-    reg_fn_pfnRead : extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>, pb : *mut u8, cb : u32, pcbRead : *mut u32, cbOffset : u64) -> u32,
-    reg_fn_pfnWrite : extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>, pb : *const u8, cb : u32, pcbWrite : *mut u32, cbOffset : u64) -> u32,
-    reg_fn_pfnNotify : extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>, fEvent : u32, pvEvent : usize, cbEvent : usize),
-    reg_fn_pfnClose : extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>),
-    reg_fn_pfnVisibleModule : extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>) -> bool,
+    reg_fn_pfnList : Option<extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>, pFileList : usize) -> c_int>,
+    reg_fn_pfnRead : Option<extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>, pb : *mut u8, cb : u32, pcbRead : *mut u32, cbOffset : u64) -> u32>,
+    reg_fn_pfnWrite : Option<extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>, pb : *const u8, cb : u32, pcbWrite : *mut u32, cbOffset : u64) -> u32>,
+    reg_fn_pfnNotify : Option<extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>, fEvent : u32, pvEvent : usize, cbEvent : usize)>,
+    reg_fn_pfnClose : Option<extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>)>,
+    reg_fn_pfnVisibleModule : Option<extern "C" fn(H : usize, ctxP : *const CVMMDLL_PLUGIN_CONTEXT<T>) -> c_int>,
     reg_fn_pvReserved : [usize; 10],
     // reg_fnfc: // TODO:
     reg_fnfc_pfnInitialize : usize,
@@ -8328,7 +8460,7 @@ fn impl_new_plugin_initialization<T>(native_h : usize, native_reginfo : usize) -
     }
 }
 
-impl<T> VmmPluginInitializationContext<T> {
+impl<T : Send + Sync + 'static> VmmPluginInitializationContext<T> {
     fn impl_register(self) -> ResultEx<()> {
         unsafe {
             let reginfo = self.h_reginfo as *mut CVMMDLL_PLUGIN_REGINFO<T>;
@@ -8358,8 +8490,8 @@ impl<T> VmmPluginInitializationContext<T> {
                 fn_notify : self.fn_notify,
                 fn_visible : self.fn_visible,
             };
-            let ctx_rust_box = Box::new(ctx_rust);
-            let ctx_native = Box::into_raw(ctx_rust_box);
+            let mut ctx_rust_box = Box::new(ctx_rust);
+            let ctx_native = &mut *ctx_rust_box as *mut VmmPluginContext<T>;
             // prepare native registration context and register:
             for i in 0..pathname_len {
                 (*reginfo).reg_info_uszPathName[i] = pathname_bytes[i];
@@ -8370,26 +8502,18 @@ impl<T> VmmPluginInitializationContext<T> {
             (*reginfo).reg_info_fRootModule = if self.is_root_module { 1 }  else { 0 };
             (*reginfo).reg_info_fRootModuleHidden = if self.is_root_module_hidden { 1 }  else { 0 };
             // native callback registration:
-            (*reginfo).reg_fn_pfnClose = impl_plugin_close_cb;
-            if self.fn_list.is_some() {
-                (*reginfo).reg_fn_pfnList = impl_plugin_list_cb;
-            }
-            if self.fn_read.is_some() {
-                (*reginfo).reg_fn_pfnRead = impl_plugin_read_cb;
-            }
-            if self.fn_write.is_some() {
-                (*reginfo).reg_fn_pfnWrite = impl_plugin_write_cb;
-            }
-            if self.fn_visible.is_some() {
-                (*reginfo).reg_fn_pfnVisibleModule = impl_plugin_visible_cb;
-            }
-            if self.fn_notify.is_some() {
-                (*reginfo).reg_fn_pfnNotify = impl_plugin_notify_cb;
-            }
-            let r = ((*reginfo).pfnPluginManager_Register)(self.h_vmm, reginfo);
+            (*reginfo).reg_fn_pfnClose = Some(impl_plugin_close_cb);
+            (*reginfo).reg_fn_pfnList = self.fn_list.map(|_| impl_plugin_list_cb::<T> as _);
+            (*reginfo).reg_fn_pfnRead = self.fn_read.map(|_| impl_plugin_read_cb::<T> as _);
+            (*reginfo).reg_fn_pfnWrite = self.fn_write.map(|_| impl_plugin_write_cb::<T> as _);
+            (*reginfo).reg_fn_pfnVisibleModule = self.fn_visible.map(|_| impl_plugin_visible_cb::<T> as _);
+            (*reginfo).reg_fn_pfnNotify = self.fn_notify.map(|_| impl_plugin_notify_cb::<T> as _);
+            let r = ((*reginfo).pfnPluginManager_Register)(self.h_vmm, reginfo) != 0;
             if !r {
+                (*reginfo).reg_info_ctxM = 0;
                 return Err(anyhow!("Failed registering plugin."));
             }
+            let _ = Box::into_raw(ctx_rust_box);
             return Ok(());
         }
     }
@@ -8413,25 +8537,25 @@ extern "C" fn impl_plugin_close_cb<T>(_h : usize, ctxp : *const CVMMDLL_PLUGIN_C
     }
 }
 
-extern "C" fn impl_plugin_list_cb<T>(_h : usize, ctxp : *const CVMMDLL_PLUGIN_CONTEXT<T>, h_pfilelist : usize) -> bool {
+extern "C" fn impl_plugin_list_cb<T>(_h : usize, ctxp : *const CVMMDLL_PLUGIN_CONTEXT<T>, h_pfilelist : usize) -> c_int {
     unsafe {
         let ctx = &*(*ctxp).ctxM;
         if ((*ctxp).magic != VMMDLL_PLUGIN_CONTEXT_MAGIC) || ((*ctxp).wVersion != VMMDLL_PLUGIN_CONTEXT_VERSION) {
-            return true;
+            return 1;
         }
         let callback = ctx.fn_list.unwrap();
         let process = if (*ctxp).pid > 0 { Some(VmmProcess{ vmm : &ctx.vmm, pid : (*ctxp).pid }) } else { None };
         let path_string = str::replace(CStr::from_ptr((*ctxp).uszPath).to_str().unwrap_or("[err]"), "\\", "/");
         let path = path_string.as_str();
         if path == "[err]" {
-            return true;
+            return 1;
         }
         let filelist = VmmPluginFileList {
             vmm : &ctx.vmm,
             h_file_list : h_pfilelist,
         };
         let _r = (callback)(ctx, process, path, &filelist);
-        return true;
+        return 1;
     }
 }
 
@@ -8456,7 +8580,7 @@ extern "C" fn impl_plugin_read_cb<T>(_h : usize, ctxp : *const CVMMDLL_PLUGIN_CO
         if r.len() == 0 {
             return VMMDLL_STATUS_END_OF_FILE;
         }
-        if r.len() > u32::MAX as usize {
+        if r.len() > cb as usize {
             return VMMDLL_STATUS_FILE_INVALID;
         }
         *pcb_read = r.len() as u32;
@@ -8490,20 +8614,20 @@ extern "C" fn impl_plugin_write_cb<T>(_h : usize, ctxp : *const CVMMDLL_PLUGIN_C
     }
 }
 
-extern "C" fn impl_plugin_visible_cb<T>(_h : usize, ctxp : *const CVMMDLL_PLUGIN_CONTEXT<T>) -> bool {
+extern "C" fn impl_plugin_visible_cb<T>(_h : usize, ctxp : *const CVMMDLL_PLUGIN_CONTEXT<T>) -> c_int {
     unsafe {
         let ctx = &*(*ctxp).ctxM;
         if ((*ctxp).magic != VMMDLL_PLUGIN_CONTEXT_MAGIC) || ((*ctxp).wVersion != VMMDLL_PLUGIN_CONTEXT_VERSION) {
-            return false;
+            return 0;
         }
         let callback = ctx.fn_visible.unwrap();
         let process = if (*ctxp).pid > 0 { Some(VmmProcess{ vmm : &ctx.vmm, pid : (*ctxp).pid }) } else { None };
         let path_string = str::replace(CStr::from_ptr((*ctxp).uszPath).to_str().unwrap_or("[err]"), "\\", "/");
         let path = path_string.as_str();
         if path == "[err]" {
-            return false;
+            return 0;
         }
-        return (callback)(ctx, process).unwrap_or(false);
+        return (callback)(ctx, process).unwrap_or(false) as c_int;
     }
 }
 
@@ -8543,12 +8667,12 @@ struct LcNative {
     LcCreate : extern "C" fn(pLcCreateConfig : *mut CLC_CONFIG) -> usize,
     LcClose : extern "C" fn(hLC : usize),
     LcMemFree : extern "C" fn(pvMem : usize),
-    LcRead : extern "C" fn(hLC : usize, pa : u64, cb : u32, pb : *mut u8) -> bool,
-    LcWrite : extern "C" fn(hLC : usize, pa : u64, cb : u32, pb : *const u8) -> bool,
-    LcGetOption : extern "C" fn(hLC : usize, fOption : u64, pqwValue : *mut u64) -> bool,
-    LcSetOption : extern "C" fn(hLC : usize, fOption : u64, qwValue : u64) -> bool,
-    LcCommand : extern "C" fn(hLC : usize, fCommand : u64, cbDataIn : u32, pbDataIn : *const u8, ppbDataOut : *mut *mut u8, pcbDataOut : *mut u32) -> bool,
-    LcCommandPtr : extern "C" fn(hLC : usize, fCommand : u64, cbDataIn : u32, pbDataIn : usize, ppbDataOut : *mut usize, pcbDataOut : *mut u32) -> bool,
+    LcRead : extern "C" fn(hLC : usize, pa : u64, cb : u32, pb : *mut u8) -> c_int,
+    LcWrite : extern "C" fn(hLC : usize, pa : u64, cb : u32, pb : *const u8) -> c_int,
+    LcGetOption : extern "C" fn(hLC : usize, fOption : u64, pqwValue : *mut u64) -> c_int,
+    LcSetOption : extern "C" fn(hLC : usize, fOption : u64, qwValue : u64) -> c_int,
+    LcCommand : extern "C" fn(hLC : usize, fCommand : u64, cbDataIn : u32, pbDataIn : *const u8, ppbDataOut : *mut *mut u8, pcbDataOut : *mut u32) -> c_int,
+    LcCommandPtr : extern "C" fn(hLC : usize, fCommand : u64, cbDataIn : u32, pbDataIn : usize, ppbDataOut : *mut usize, pcbDataOut : *mut u32) -> c_int,
 }
 
 impl fmt::Display for LeechCore {
@@ -8612,41 +8736,17 @@ impl Clone for LeechCore {
     }
 }
 
-impl<T> Drop for LcBarContext<'_, T> {
-    fn drop(&mut self) {
-        let mut native_ctx : usize = 0;
-        let r = (self.lc.native.LcCommandPtr)(self.lc.native.h, LeechCore::LC_CMD_FPGA_BAR_CONTEXT_RD, 0, 0, &mut native_ctx, std::ptr::null_mut());
-        if r && self.native_ctx == native_ctx {
-            let _r = (self.lc.native.LcCommandPtr)(self.lc.native.h, LeechCore::LC_CMD_FPGA_BAR_FUNCTION_CALLBACK, 0, 0, std::ptr::null_mut(), std::ptr::null_mut());
-            let _r = (self.lc.native.LcCommandPtr)(self.lc.native.h, LeechCore::LC_CMD_FPGA_BAR_CONTEXT, 0, 0, std::ptr::null_mut(), std::ptr::null_mut());
-        }
-    }
-}
 
 impl<T> Drop for LcBarContextWrap<'_, T> {
     fn drop(&mut self) {
-        unsafe {
-            drop(Box::from_raw(self.native));
-        }
+        leechcore_callbacks::unregister(&self.ctx.lc, self.ctx.native_ctx, true);
     }
 }
 
-impl<T> Drop for LcTlpContext<'_, T> {
-    fn drop(&mut self) {
-        let mut native_ctx : usize = 0;
-        let r = (self.lc.native.LcCommandPtr)(self.lc.native.h, LeechCore::LC_CMD_FPGA_TLP_CONTEXT_RD, 0, 0, &mut native_ctx, std::ptr::null_mut());
-        if r && self.native_ctx == native_ctx {
-            let _r = (self.lc.native.LcCommandPtr)(self.lc.native.h, LeechCore::LC_CMD_FPGA_TLP_FUNCTION_CALLBACK, 0, 0, std::ptr::null_mut(), std::ptr::null_mut());
-            let _r = (self.lc.native.LcCommandPtr)(self.lc.native.h, LeechCore::LC_CMD_FPGA_TLP_CONTEXT, 0, 0, std::ptr::null_mut(), std::ptr::null_mut());
-        }
-    }
-}
 
 impl<T> Drop for LcTlpContextWrap<'_, T> {
     fn drop(&mut self) {
-        unsafe {
-            drop(Box::from_raw(self.native));
-        }
+        leechcore_callbacks::unregister(&self.ctx.lc, self.ctx.native_ctx, false);
     }
 }
 
@@ -8721,50 +8821,48 @@ impl LeechCore {
 
     fn impl_get_option(&self, config_id : u64) -> ResultEx<u64> {
         let mut v = 0;
-        let f = (self.native.LcGetOption)(self.native.h, config_id, &mut v);
+        let f = (self.native.LcGetOption)(self.native.h, config_id, &mut v) != 0;
         return if f { Ok(v) } else { Err(anyhow!("LcGetOption: fail")) };
     }
 
     fn impl_set_option(&self, config_id : u64, config_value : u64) -> ResultEx<()> {
-        let f = (self.native.LcSetOption)(self.native.h, config_id, config_value);
+        let f = (self.native.LcSetOption)(self.native.h, config_id, config_value) != 0;
         return if f { Ok(()) } else { Err(anyhow!("LcSetOption: fail")) };
     }
 
     fn impl_mem_read(&self, pa : u64, size : usize) -> ResultEx<Vec<u8>> {
         let cb = u32::try_from(size)?;
         let mut pb_result: Vec<u8> = vec![0u8; size];
-        let r = (self.native.LcRead)(self.native.h, pa, cb, pb_result.as_mut_ptr());
+        let r = (self.native.LcRead)(self.native.h, pa, cb, pb_result.as_mut_ptr()) != 0;
         if !r {
             return Err(anyhow!("LcRead: fail."));
         }
         return Ok(pb_result);
     }
 
-    fn impl_mem_read_as<T>(&self, pa : u64) -> ResultEx<T> {
-        unsafe {
-            let cb = u32::try_from(std::mem::size_of::<T>())?;
-            let mut result : T = std::mem::zeroed();
-            let r = (self.native.LcRead)(self.native.h, pa, cb, &mut result as *mut _ as *mut u8);
-            if !r {
-                return Err(anyhow!("LcRead: fail."));
-            }
-            return Ok(result);
+    fn impl_mem_read_as<T : Pod>(&self, pa : u64) -> ResultEx<T> {
+        let cb = u32::try_from(std::mem::size_of::<T>())?;
+        let mut result = T::zeroed();
+        let r = (self.native.LcRead)(self.native.h, pa, cb, &mut result as *mut _ as *mut u8) != 0;
+        if !r {
+            return Err(anyhow!("LcRead: fail."));
         }
+        return Ok(result);
     }
 
     fn impl_mem_write(&self, va : u64, data : &Vec<u8>) -> ResultEx<()> {
         let cb = u32::try_from(data.len())?;
         let pb = data.as_ptr();
-        let r = (self.native.LcWrite)(self.native.h, va, cb, pb);
+        let r = (self.native.LcWrite)(self.native.h, va, cb, pb) != 0;
         if !r {
             return Err(anyhow!("LcWrite: fail."));
         }
         return Ok(());
     }
 
-    fn impl_mem_write_as<T>(&self, va : u64, data : &T) -> ResultEx<()> {
+    fn impl_mem_write_as<T : Pod>(&self, va : u64, data : &T) -> ResultEx<()> {
         let cb = u32::try_from(std::mem::size_of::<T>())?;
-        let r = (self.native.LcWrite)(self.native.h, va, cb, data as *const _ as *const u8);
+        let r = (self.native.LcWrite)(self.native.h, va, cb, data as *const _ as *const u8) != 0;
         if !r {
             return Err(anyhow!("LcWrite: fail."));
         }
@@ -8772,6 +8870,9 @@ impl LeechCore {
     }
 
     fn impl_command(&self, command_id : u64, data : Option<&Vec<u8>>) -> ResultEx<Option<Vec<u8>>> {
+        if !LeechCore::impl_command_data_supported(command_id) {
+            return Err(anyhow!("Command requires a dedicated typed API."));
+        }
         unsafe {
             let mut pb_out : *mut u8 = std::ptr::null_mut();
             let mut cb_out : u32 = 0;
@@ -8787,7 +8888,7 @@ impl LeechCore {
                     pb_in = std::ptr::null();
                 },
             }
-            let r = (self.native.LcCommand)(self.native.h, command_id, cb_in, pb_in, &mut pb_out, &mut cb_out);
+            let r = (self.native.LcCommand)(self.native.h, command_id, cb_in, pb_in, &mut pb_out, &mut cb_out) != 0;
             if !r {
                 return Err(anyhow!("LcCommand: fail."));
             }
@@ -8799,6 +8900,15 @@ impl LeechCore {
             (self.native.LcMemFree)(pb_out as usize);
             return Ok(Some(pb_result));
         }
+    }
+
+    fn impl_command_data_supported(command_id : u64) -> bool {
+        return !matches!(command_id & 0xffffffff00000000,
+            LeechCore::LC_CMD_FPGA_TLP_WRITE_MULTIPLE |
+            LeechCore::LC_CMD_FPGA_TLP_CONTEXT | LeechCore::LC_CMD_FPGA_TLP_CONTEXT_RD |
+            LeechCore::LC_CMD_FPGA_TLP_FUNCTION_CALLBACK | LeechCore::LC_CMD_FPGA_TLP_FUNCTION_CALLBACK_RD |
+            LeechCore::LC_CMD_FPGA_BAR_CONTEXT | LeechCore::LC_CMD_FPGA_BAR_CONTEXT_RD |
+            LeechCore::LC_CMD_FPGA_BAR_FUNCTION_CALLBACK | LeechCore::LC_CMD_FPGA_BAR_FUNCTION_CALLBACK_RD);
     }
 
     fn impl_get_memmap(&self) -> ResultEx<String> {
@@ -8824,7 +8934,7 @@ impl LeechCore {
         unsafe {
             let mut cb_out = 0;
             let mut pb_out = 0;
-            let r = (self.native.LcCommandPtr)(self.native.h, LeechCore::LC_CMD_FPGA_BAR_INFO, 0, 0, &mut pb_out, &mut cb_out);
+            let r = (self.native.LcCommandPtr)(self.native.h, LeechCore::LC_CMD_FPGA_BAR_INFO, 0, 0, &mut pb_out, &mut cb_out) != 0;
             if !r {
                 return Err(anyhow!("LcCommand: fail."));
             }
@@ -8854,86 +8964,60 @@ impl LeechCore {
         if tlp.len() % 4 > 0 {
             return Err(anyhow!("TLP length must be a multiple of 4."));
         }
-        let r = (self.native.LcCommand)(self.native.h, LeechCore::LC_CMD_FPGA_TLP_WRITE_SINGLE, tlp.len() as u32, tlp.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut());
+        let r = (self.native.LcCommand)(self.native.h, LeechCore::LC_CMD_FPGA_TLP_WRITE_SINGLE, tlp.len() as u32, tlp.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut()) != 0;
         if !r {
             return Err(anyhow!("LcCommand: fail."));
         }
         return Ok(());
     }
 
-    fn impl_pcie_bar_callback<T>(&self, ctx_user : T, fn_bar_callback : fn(ctx : &LcBarContext<T>, req : &LcBarRequest) -> ResultEx<()>) -> ResultEx<LcBarContextWrap<T>> {
+    fn impl_pcie_bar_callback<T : Send + Sync + 'static>(&self, ctx_user : T, fn_bar_callback : fn(ctx : &LcBarContext<T>, req : &LcBarRequest) -> ResultEx<()>) -> ResultEx<LcBarContextWrap<T>> {
+        let native_ctx = leechcore_callbacks::context_id()?;
+        let lc = LeechCore::new(&self.path_lc, &format!("existing://0x{:x}", self.native.h), 0)?;
+        let ctx = Arc::new(LcBarContext {
+            lc,
+            ctxlock : std::sync::RwLock::new(ctx_user),
+            fn_callback : fn_bar_callback,
+            native_ctx,
+            _lifetime : std::marker::PhantomData,
+        });
+        let callback = LeechCore::impl_pcie_bar_callback_external::<T> as *const () as usize;
+        leechcore_callbacks::register(self, native_ctx, &ctx, true, callback)?;
+        return Ok(LcBarContextWrap { ctx, _lifetime : std::marker::PhantomData });
+    }
+
+    fn impl_pcie_tlp_callback<T : Send + Sync + 'static>(&self, ctx_user : T, fn_tlp_callback : fn(ctx : &LcTlpContext<T>, tlp : &[u8], tlp_str : &str) -> ResultEx<()>) -> ResultEx<LcTlpContextWrap<T>> {
+        self.set_option(LeechCore::LC_OPT_FPGA_TLP_READ_CB_WITHINFO, 1)?;
+        let native_ctx = leechcore_callbacks::context_id()?;
+        let lc = LeechCore::new(&self.path_lc, &format!("existing://0x{:x}", self.native.h), 0)?;
+        let ctx = Arc::new(LcTlpContext {
+            lc,
+            ctxlock : std::sync::RwLock::new(ctx_user),
+            fn_callback : fn_tlp_callback,
+            native_ctx,
+            _lifetime : std::marker::PhantomData,
+        });
+        let callback = LeechCore::impl_pcie_tlp_callback_external::<T> as *const () as usize;
+        leechcore_callbacks::register(self, native_ctx, &ctx, false, callback)?;
+        return Ok(LcTlpContextWrap { ctx, _lifetime : std::marker::PhantomData });
+    }
+
+    extern "C" fn impl_pcie_tlp_callback_external<T : Send + Sync + 'static>(native_ctx : *const LcTlpContext<T>, cbTlp : u32, pbTlp : *const u8, cbInfo : u32, szInfo : *const u8) {
         unsafe {
-            let ctx = LcBarContext {
-                lc : self,
-                ctxlock : std::sync::RwLock::new(ctx_user),
-                fn_callback : fn_bar_callback,
-                native_ctx : 0,
-            };
-            let ctx_rust_box = Box::new(ctx);
-            let ctx_native = Box::into_raw(ctx_rust_box);   // destroys ownership: returned LcBarContextWrap Drop is responsible for free.
-            (*ctx_native).native_ctx = ctx_native as usize;
-            let native_pfn = LeechCore::impl_pcie_bar_callback_external::<T> as usize;
-            let r = (self.native.LcCommandPtr)(self.native.h, LeechCore::LC_CMD_FPGA_BAR_CONTEXT, 0, ctx_native as usize, std::ptr::null_mut(), std::ptr::null_mut());
-            if !r {
-                return Err(anyhow!("LcCommand: fail."));
-            }
-            let r = (self.native.LcCommandPtr)(self.native.h, LeechCore::LC_CMD_FPGA_BAR_FUNCTION_CALLBACK, 0, native_pfn, std::ptr::null_mut(), std::ptr::null_mut());
-            if !r {
-                return Err(anyhow!("LcCommand: fail."));
-            }
-            let ctx_wrap = LcBarContextWrap {
-                ctx : &*ctx_native,
-                native : ctx_native,
-            };
-            return Ok(ctx_wrap);
+            let Some(ctx) = leechcore_callbacks::context::<LcTlpContext<'static, T>>(native_ctx as usize) else { return; };
+            if (cbTlp != 0 && pbTlp.is_null()) || (cbInfo != 0 && szInfo.is_null()) { return; }
+            let tlp = if cbTlp == 0 { &[] } else { std::slice::from_raw_parts(pbTlp, cbTlp as usize) };
+            let info = if cbInfo == 0 { &[] } else { std::slice::from_raw_parts(szInfo, cbInfo as usize) };
+            let info = String::from_utf8_lossy(info);
+            let _r = (ctx.fn_callback)(&ctx, tlp, &info);
         }
     }
 
-    fn impl_pcie_tlp_callback<T>(&self, ctx_user : T, fn_tlp_callback : fn(ctx : &LcTlpContext<T>, tlp : &[u8], tlp_str : &str) -> ResultEx<()>) -> ResultEx<LcTlpContextWrap<T>> {
-        unsafe {
-            let ctx = LcTlpContext {
-                lc : self,
-                ctxlock : std::sync::RwLock::new(ctx_user),
-                fn_callback : fn_tlp_callback,
-                native_ctx : 0,
-            };
-            let ctx_rust_box = Box::new(ctx);
-            let ctx_native = Box::into_raw(ctx_rust_box);   // destroys ownership: returned LcTlpContextWrap Drop is responsible for free.
-            (*ctx_native).native_ctx = ctx_native as usize;
-            let native_pfn = LeechCore::impl_pcie_tlp_callback_external::<T> as usize;
-            let r = (self.native.LcSetOption)(self.native.h, LeechCore::LC_OPT_FPGA_TLP_READ_CB_WITHINFO, 1);
-            if !r {
-                return Err(anyhow!("LcSetOption: fail."));
-            }
-            let r = (self.native.LcCommandPtr)(self.native.h, LeechCore::LC_CMD_FPGA_TLP_CONTEXT, 0, ctx_native as usize, std::ptr::null_mut(), std::ptr::null_mut());
-            if !r {
-                return Err(anyhow!("LcCommand: fail."));
-            }
-            let r = (self.native.LcCommandPtr)(self.native.h, LeechCore::LC_CMD_FPGA_TLP_FUNCTION_CALLBACK, 0, native_pfn, std::ptr::null_mut(), std::ptr::null_mut());
-            if !r {
-                return Err(anyhow!("LcCommand: fail."));
-            }
-            let ctx_wrap = LcTlpContextWrap {
-                ctx : &*ctx_native,
-                native : ctx_native,
-            };
-            return Ok(ctx_wrap);
-        }
-    }
-
-    extern "C" fn impl_pcie_tlp_callback_external<T>(native_ctx : *const LcTlpContext<T>, cbTlp : u32, pbTlp : *const u8, cbInfo : u32, szInfo : *const u8) {
-        unsafe {
-            let ctx : &LcTlpContext<T> = &*native_ctx;
-            let tlp = std::slice::from_raw_parts(pbTlp, cbTlp as usize);
-            let info = std::str::from_utf8_unchecked(std::slice::from_raw_parts(szInfo, cbInfo as usize));
-            let _r = (ctx.fn_callback)(ctx, tlp, info);
-        }
-    }
-
-    extern "C" fn impl_pcie_bar_callback_external<T>(native_bar_request : *mut LC_BAR_REQUEST) {
+    extern "C" fn impl_pcie_bar_callback_external<T : Send + Sync + 'static>(native_bar_request : *mut LC_BAR_REQUEST) {
         unsafe {
             let req = &*native_bar_request;
-            let ctx = &*(req.ctx as *const LcBarContext<T>);
+            let Some(ctx) = leechcore_callbacks::context::<LcBarContext<'static, T>>(req.ctx) else { return; };
+            if req.cbData as usize > req.pbData.len() { return; }
             // assign bar
             let ne = &*req.pBar;
             let bar = LcBar {
@@ -8965,7 +9049,7 @@ impl LeechCore {
                 data_offset : req.oData,
                 data_write,
             };
-            let _r = (ctx.fn_callback)(ctx, &bar_request);
+            let _r = (ctx.fn_callback)(&ctx, &bar_request);
         }
     }
 }
@@ -8977,12 +9061,12 @@ impl LcBarRequest {
             if !self.is_read {
                 return Err(anyhow!("LcBarRequest: only allowed to reply to read requests."));
             }
-            if !is_fail && self.data_size != data_reply.len() as u32 {
+            if data_reply.len() > (*self.native).pbData.len() || (!is_fail && self.data_size as usize != data_reply.len()) {
                 return Err(anyhow!("LcBarRequest: reply data size mismatch."));
             }
             (*self.native).fReadReply = 1;
             (*self.native).cbData = data_reply.len() as u32;
-            (*self.native).pbData[..data_reply.len()].copy_from_slice(data_reply);
+            (&mut (*self.native).pbData)[..data_reply.len()].copy_from_slice(data_reply);
             return Ok(());
         }
     }
@@ -9035,5 +9119,5 @@ struct LC_BAR_REQUEST {
     fWrite : u32,
     cbData : u32,
     oData : u64,
-    pbData : [u8; 1024],
+    pbData : [u8; 4096],
 }

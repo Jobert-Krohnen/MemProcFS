@@ -119,10 +119,13 @@ HANDLE CreateThread(
     PHANDLE_INTERNAL_THREAD ph;
     pthread_t thread;
     int status;
-    status = pthread_create(&thread, NULL, lpStartAddress, lpParameter);
-    if(status) { return NULL; }
     ph = malloc(sizeof(HANDLE_INTERNAL_THREAD));
     if(!ph) { return NULL; }
+    status = pthread_create(&thread, NULL, lpStartAddress, lpParameter);
+    if(status) {
+        free(ph);
+        return NULL;
+    }
     ph->magic = OSCOMPATIBILITY_HANDLE_INTERNAL;
     ph->type = OSCOMPATIBILITY_HANDLE_TYPE_THREAD;
     ph->thread = thread;

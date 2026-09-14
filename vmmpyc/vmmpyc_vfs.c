@@ -97,7 +97,7 @@ VmmPycVfs_list(PyObj_Vfs *self, PyObject *args)
     }
     if(!result) {
         Py_DECREF(pyDict);
-        PyErr_Format(PyExc_RuntimeError, "Vfs.list(): Failed.");
+        return PyErr_Format(PyExc_RuntimeError, "Vfs.list(): Failed.");
     }
     return pyDict;
 }
@@ -141,7 +141,7 @@ VmmPycVfs_write(PyObj_Vfs *self, PyObject *args)
     BOOL result;
     SIZE_T cb;
     DWORD cbWritten;
-    ULONG64 cbOffset;
+    ULONG64 cbOffset = 0;
     PBYTE pb;
     LPSTR uszPathPython = NULL, uszPath;
     if(!self->fValid) { return PyErr_Format(PyExc_RuntimeError, "Vfs.write(): Not initialized."); }

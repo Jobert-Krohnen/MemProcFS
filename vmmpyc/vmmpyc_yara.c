@@ -32,7 +32,7 @@ BOOL VmmPycYara_SearchResultCB(_In_ PVOID pvContext, _In_ PVMMYARA_RULE_MATCH pR
             for(i = 0; i < pRuleMatch->cMeta; i++) {
                 PyDict_SetItemString_DECREF(pyDictMeta, pRuleMatch->Meta[i].szIdentifier, PyUnicode_FromString(pRuleMatch->Meta[i].szString));
             }
-            PyDict_SetItemString_DECREF(pyDictResult, "meta", pyListTags);
+            PyDict_SetItemString_DECREF(pyDictResult, "meta", pyDictMeta);
         }
         if((pyDictMatch = PyDict_New())) {
             for(i = 0; i < pRuleMatch->cStrings; i++) {
@@ -74,16 +74,14 @@ VmmPycYara_start(PyObj_Yara *self, PyObject *args)
 {
     HANDLE hThread;
     if(!self->fValid) { return PyErr_Format(PyExc_RuntimeError, "VmmYara.start(): Not initialized."); }
-    if(self->fStarted) { Py_BuildValue("s", NULL); }      // None returned on success.
+    if(self->fStarted) { return Py_BuildValue("s", NULL); }      // None returned on success.
+    self->fStarted = TRUE;
     Py_BEGIN_ALLOW_THREADS;
-    if(!self->fStarted) {
-        self->fStarted = TRUE;
-        hThread = CreateThread(NULL, 0, VmmPycYara_start_ThreadProc, self, 0, NULL);
-        if(hThread) {
-            CloseHandle(hThread);
-        } else {
-            self->fCompleted = TRUE;
-        }
+    hThread = CreateThread(NULL, 0, VmmPycYara_start_ThreadProc, self, 0, NULL);
+    if(hThread) {
+        CloseHandle(hThread);
+    } else {
+        self->fCompleted = TRUE;
     }
     Py_END_ALLOW_THREADS;
     return Py_BuildValue("s", NULL);        // None returned on success.
